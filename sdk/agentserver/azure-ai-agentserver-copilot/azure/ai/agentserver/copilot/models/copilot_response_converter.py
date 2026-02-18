@@ -2,16 +2,20 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # ---------------------------------------------------------
 import datetime
-from typing import Generator, Optional
+import json
+from typing import Any, Dict, Generator, Optional
 
 from copilot.generated.session_events import SessionEvent, SessionEventType
 
 from azure.ai.agentserver.core.models import Response as OpenAIResponse
 from azure.ai.agentserver.core.models.projects import (
     ItemContentOutputText,
+    MCPApprovalRequestItemResource,
     ResponseCompletedEvent,
     ResponseCreatedEvent,
+    ResponseIncompleteEvent,
     ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
     ResponsesAssistantMessageItemResource,
     ResponseStreamEvent,
     ResponseTextDeltaEvent,
@@ -45,6 +49,34 @@ class CopilotResponseConverter:
                     content=[
                         ItemContentOutputText(text=text, annotations=[]),
                     ],
+                )
+            ],
+        )
+
+    @staticmethod
+    def to_approval_request_response(
+        approval_info: Dict[str, Any], context: AgentRunContext,
+    ) -> OpenAIResponse:
+        """Build a non-streaming incomplete response containing an approval request.
+
+        :param approval_info: Dict with ``request_id`` and ``permission_request``.
+        :param context: The agent run context.
+        :return: An OpenAI-compatible Response with status ``incomplete``.
+        """
+        perm = approval_info["permission_request"]
+        return OpenAIResponse(
+            id=context.response_id,
+            created_at=datetime.datetime.now(),
+            status="incomplete",
+            output=[
+                MCPApprovalRequestItemResource(
+                    id=approval_info["request_id"],
+                    server_label="copilot-cli",
+                    name=perm.get("kind", "unknown"),
+                    arguments=json.dumps(
+                        {k: v for k, v in perm.items() if k != "kind"},
+                        default=str,
+                    ),
                 )
             ],
         )
@@ -97,6 +129,101 @@ class CopilotResponseConverter:
                         content=[ItemContentOutputText(text=assembled, annotations=[])],
                     )
                 ],
+            )
+        )
+
+    @staticmethod
+    def to_stream_events_with_approval(
+        events: list[SessionEvent],
+        approval_info: Dict[str, Any],
+        context: AgentRunContext,
+    ) -> Generator[ResponseStreamEvent, None, None]:
+        """Yield text events collected so far, then an approval request, then ``response.incomplete``.
+
+        :param events: Copilot session events collected before the approval was requested.
+        :param approval_info: Dict with ``request_id`` and ``permission_request``.
+        :param context: The agent run context.
+        """
+        msg_id = context.id_generator.generate_message_id()
+
+        yield ResponseCreatedEvent(response=OpenAIResponse(id=context.response_id, output=[]))
+
+        # Emit any text that was produced before the tool approval
+        assembled = ""
+        text_output_index = 0
+        has_text = False
+        for event in events:
+            text = _extract_text(event)
+            if text:
+                if not has_text:
+                    yield ResponseOutputItemAddedEvent(
+                        output_index=text_output_index,
+                        item=ResponsesAssistantMessageItemResource(
+                            id=msg_id,
+                            status="in_progress",
+                            content=[ItemContentOutputText(text="", annotations=[])],
+                        ),
+                    )
+                    has_text = True
+                assembled += text
+                yield ResponseTextDeltaEvent(
+                    output_index=text_output_index,
+                    content_index=0,
+                    delta=text,
+                )
+
+        if has_text:
+            yield ResponseTextDoneEvent(
+                output_index=text_output_index, content_index=0, text=assembled
+            )
+            yield ResponseOutputItemDoneEvent(
+                output_index=text_output_index,
+                item=ResponsesAssistantMessageItemResource(
+                    id=msg_id,
+                    status="completed",
+                    content=[ItemContentOutputText(text=assembled, annotations=[])],
+                ),
+            )
+
+        # Emit the approval request as an output item
+        perm = approval_info["permission_request"]
+        approval_item = MCPApprovalRequestItemResource(
+            id=approval_info["request_id"],
+            server_label="copilot-cli",
+            name=perm.get("kind", "unknown"),
+            arguments=json.dumps(
+                {k: v for k, v in perm.items() if k != "kind"},
+                default=str,
+            ),
+        )
+        approval_output_index = 1 if has_text else 0
+        yield ResponseOutputItemAddedEvent(
+            output_index=approval_output_index,
+            item=approval_item,
+        )
+        yield ResponseOutputItemDoneEvent(
+            output_index=approval_output_index,
+            item=approval_item,
+        )
+
+        # End the response as incomplete (awaiting approval)
+        output_items = []
+        if has_text:
+            output_items.append(
+                ResponsesAssistantMessageItemResource(
+                    id=msg_id,
+                    status="completed",
+                    content=[ItemContentOutputText(text=assembled, annotations=[])],
+                )
+            )
+        output_items.append(approval_item)
+
+        yield ResponseIncompleteEvent(
+            response=OpenAIResponse(
+                id=context.response_id,
+                created_at=datetime.datetime.now(),
+                status="incomplete",
+                output=output_items,
             )
         )
 
