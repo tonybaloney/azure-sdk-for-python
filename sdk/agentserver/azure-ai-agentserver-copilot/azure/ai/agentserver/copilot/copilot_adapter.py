@@ -5,8 +5,7 @@
 import asyncio
 import os
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
@@ -23,18 +22,6 @@ from .models.copilot_response_converter import CopilotResponseConverter
 logger = get_logger()
 
 _COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
-
-
-@dataclass
-class _PendingSession:
-    """Holds a Copilot session that is paused waiting for tool approval."""
-
-    session: Any
-    approval_future: asyncio.Future
-    event_queue: asyncio.Queue
-    done_event: asyncio.Event
-    approval_request_id: str
-    permission_request: Dict[str, Any] = field(default_factory=dict)
 
 
 def _build_session_config() -> SessionConfig:
@@ -94,10 +81,15 @@ class CopilotAdapter(FoundryCBAgent):
     Tool approval
     ~~~~~~~~~~~~~
     When the Copilot CLI requests permission to execute a tool (file write,
-    shell command, etc.) the adapter yields an ``mcp_approval_request``
-    output item and returns the response as ``incomplete``.  The caller
-    sends a follow-up request containing an ``mcp_approval_response`` item
-    to approve or deny, and the adapter resumes the same Copilot session.
+    shell command, etc.) the adapter **denies** the tool immediately so the
+    session can complete without hanging, but captures the request details.
+    The response includes both the model's text *and* an
+    ``mcp_approval_request`` output item, with ``status="incomplete"``.
+
+    If the caller sends a follow-up request containing an
+    ``mcp_approval_response`` item with ``approve=true``, the adapter
+    re-runs the prompt in a **new** session with those specific tools
+    pre-approved.
 
     :param session_config: Override for the Copilot session config.  When
         *None* the config is built automatically from environment variables.
@@ -109,10 +101,6 @@ class CopilotAdapter(FoundryCBAgent):
         self._session_config = session_config or _build_session_config()
         self._client: Optional[CopilotClient] = None
         self._credential = None
-
-        # Map approval_request_id → _PendingSession for sessions paused
-        # on a tool approval request.
-        self._pending_sessions: Dict[str, _PendingSession] = {}
 
         # Keep credential for token refresh when using Foundry
         if os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL"):
@@ -126,7 +114,6 @@ class CopilotAdapter(FoundryCBAgent):
             return self._session_config
 
         token = self._credential.get_token(_COGNITIVE_SERVICES_SCOPE).token
-        # Rebuild provider with fresh token
         self._session_config["provider"]["bearer_token"] = token
         return self._session_config
 
@@ -166,38 +153,91 @@ class CopilotAdapter(FoundryCBAgent):
         prompt = CopilotRequestConverter(context.request).convert()
         logger.debug(f"Copilot prompt: {prompt!r}")
 
+        return await self._run_session(prompt, context, approved_tools=None)
+
+    # ------------------------------------------------------------------
+    # Core session runner
+    # ------------------------------------------------------------------
+
+    async def _run_session(
+        self,
+        prompt: str,
+        context: AgentRunContext,
+        approved_tools: Optional[List[Dict[str, Any]]],
+    ):
+        """Run a Copilot session, denying unapproved tool requests.
+
+        Tools are denied immediately (so the CLI doesn't block) and their
+        details are captured.  If any tools were denied, the response is
+        returned as ``incomplete`` with ``mcp_approval_request`` items.
+        """
         client = await self._ensure_client()
         config = self._refresh_token_if_needed()
 
-        # Set up shared state for the permission handler
-        loop = asyncio.get_running_loop()
-        approval_queue: asyncio.Queue = asyncio.Queue()
+        # Track denied tool requests
+        denied_requests: List[Dict[str, Any]] = []
 
-        async def _on_permission(
-            req: PermissionRequest, _ctx: dict
+        # Build a set of pre-approved tool call IDs
+        approved_ids: set = set()
+        if approved_tools:
+            for t in approved_tools:
+                approved_ids.add(t.get("toolCallId", ""))
+
+        def _on_permission(
+            req: PermissionRequest, _ctx: dict,
         ) -> PermissionRequestResult:
-            """Pause execution and surface the approval request to the caller."""
+            tool_call_id = req.get("toolCallId", "")
+            kind = req.get("kind", "unknown")
+            if tool_call_id in approved_ids:
+                logger.info(f"Pre-approved tool: kind={kind} id={tool_call_id}")
+                return PermissionRequestResult(kind="approved")
             request_id = str(uuid.uuid4())
-            future: asyncio.Future = loop.create_future()
-            logger.info(
-                f"Tool approval requested: kind={req.get('kind')} "
-                f"id={request_id}"
+            logger.info(f"Denied tool (needs approval): kind={kind} id={request_id}")
+            denied_requests.append({
+                "request_id": request_id,
+                "permission_request": dict(req),
+            })
+            return PermissionRequestResult(
+                kind="denied-no-approval-rule-and-could-not-request-from-user"
             )
-            await approval_queue.put(
-                {"request_id": request_id, "permission_request": dict(req), "future": future}
-            )
-            # Block the CLI until the caller approves or denies
-            return await future
 
         session_config = SessionConfig(**config, on_permission_request=_on_permission)
         session = await client.create_session(session_config)
 
         try:
-            if not context.stream:
-                return await self._run_non_stream(
-                    session, prompt, context, approval_queue
+            collected_events = []
+            done = asyncio.Event()
+
+            def on_event(event):
+                collected_events.append(event)
+                if event.type == SessionEventType.SESSION_IDLE:
+                    done.set()
+
+            session.on(on_event)
+            await session.send(MessageOptions(prompt=prompt))
+            await asyncio.wait_for(done.wait(), timeout=300)
+            await session.destroy()
+
+            full_text = _collect_text(collected_events)
+            logger.debug(
+                f"Session collected {len(collected_events)} events, "
+                f"text length={len(full_text)}, "
+                f"denied tools={len(denied_requests)}"
+            )
+
+            if denied_requests:
+                if not context.stream:
+                    return CopilotResponseConverter.to_approval_request_response(
+                        full_text, denied_requests, prompt, context,
+                    )
+                return CopilotResponseConverter.to_stream_events_with_approval(
+                    collected_events, denied_requests, prompt, context,
                 )
-            return self._run_stream(session, prompt, context, approval_queue)
+
+            if not context.stream:
+                return CopilotResponseConverter.to_response(full_text, context)
+            return CopilotResponseConverter.to_stream_events(collected_events, context)
+
         except Exception as e:
             logger.error(f"Error during Copilot agent run: {e}")
             raise
@@ -207,185 +247,32 @@ class CopilotAdapter(FoundryCBAgent):
     # ------------------------------------------------------------------
 
     async def _handle_approval_response(
-        self, approval: Dict[str, Any], context: AgentRunContext
+        self, approval: Dict[str, Any], context: AgentRunContext,
     ):
-        """Resume a pending session after the caller approves/denies a tool."""
-        request_id = approval.get("approval_request_id", "")
-        pending = self._pending_sessions.pop(request_id, None)
-        if pending is None:
-            logger.warning(f"No pending session for approval_request_id={request_id}")
-            return CopilotResponseConverter.to_response(
-                "Error: no pending tool approval found for the given ID.", context
-            )
-
+        """Re-run the session with the caller-approved tools."""
         approved = approval.get("approve", False)
-        reason = approval.get("reason", "")
-        if approved:
-            kind = "approved"
-            logger.info(f"Tool approved: {request_id}")
-        else:
-            kind = "denied-interactively-by-user"
-            logger.info(f"Tool denied: {request_id} reason={reason}")
-
-        # Unblock the Copilot CLI's on_permission_request callback
-        pending.approval_future.set_result(
-            PermissionRequestResult(kind=kind)
-        )
-
-        # Wait for the session to finish processing
-        await asyncio.wait_for(pending.done_event.wait(), timeout=300)
-
-        # Collect remaining events
-        remaining_events = []
-        while not pending.event_queue.empty():
-            remaining_events.append(pending.event_queue.get_nowait())
-
-        await pending.session.destroy()
-
-        if not context.stream:
-            full_text = _collect_text(remaining_events)
-            return CopilotResponseConverter.to_response(full_text, context)
-        return CopilotResponseConverter.to_stream_events(remaining_events, context)
-
-    # ------------------------------------------------------------------
-    # Non-streaming
-    # ------------------------------------------------------------------
-
-    async def _run_non_stream(
-        self, session, prompt: str, context: AgentRunContext,
-        approval_queue: asyncio.Queue,
-    ):
-        """Execute a non-streaming request.
-
-        If a tool approval is needed the response is returned as incomplete
-        with an ``mcp_approval_request`` output item.
-        """
-        event_queue: asyncio.Queue = asyncio.Queue()
-        done = asyncio.Event()
-
-        def on_event(event):
-            event_queue.put_nowait(event)
-            if event.type == SessionEventType.SESSION_IDLE:
-                done.set()
-
-        session.on(on_event)
-        await session.send(MessageOptions(prompt=prompt))
-
-        # Race: either the session finishes or a tool approval is requested
-        done_task = asyncio.ensure_future(done.wait())
-        approval_task = asyncio.ensure_future(approval_queue.get())
-        finished, pending_tasks = await asyncio.wait(
-            {done_task, approval_task},
-            timeout=300,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for t in pending_tasks:
-            t.cancel()
-
-        if approval_task in finished:
-            # Tool approval requested — park the session
-            approval_info = approval_task.result()
-            return self._park_session_and_return_approval(
-                session, event_queue, done, approval_info, context
+        if not approved:
+            logger.info("Tool denied by caller")
+            return CopilotResponseConverter.to_response(
+                "The requested tool operation was denied.", context,
             )
 
-        # Normal completion
-        collected = _drain_queue(event_queue)
-        await session.destroy()
-        full_text = _collect_text(collected)
-        logger.debug(
-            f"Non-stream collected {len(collected)} events, "
-            f"text length={len(full_text)}"
+        # Recover the original prompt stashed in the approval item
+        original_prompt = approval.get("_original_prompt")
+        if not original_prompt:
+            original_prompt = CopilotRequestConverter(context.request).convert()
+
+        approved_tool = approval.get("_permission_request")
+        approved_tools = [approved_tool] if approved_tool else []
+
+        logger.info(f"Re-running session with {len(approved_tools)} approved tools")
+        return await self._run_session(
+            original_prompt, context, approved_tools=approved_tools,
         )
-        return CopilotResponseConverter.to_response(full_text, context)
 
     # ------------------------------------------------------------------
-    # Streaming
+    # Trace / identity
     # ------------------------------------------------------------------
-
-    def _run_stream(
-        self, session, prompt: str, context: AgentRunContext,
-        approval_queue: asyncio.Queue,
-    ) -> AsyncGenerator:
-        """Return an async generator that streams response events.
-
-        If a tool approval is needed the stream yields an
-        ``mcp_approval_request`` item and ends with ``response.incomplete``.
-        """
-        return self._stream_generator(session, prompt, context, approval_queue)
-
-    async def _stream_generator(
-        self, session, prompt: str, context: AgentRunContext,
-        approval_queue: asyncio.Queue,
-    ) -> AsyncGenerator:
-        event_queue: asyncio.Queue = asyncio.Queue()
-        done = asyncio.Event()
-
-        def on_event(event):
-            event_queue.put_nowait(event)
-            if event.type == SessionEventType.SESSION_IDLE:
-                done.set()
-
-        session.on(on_event)
-        await session.send(MessageOptions(prompt=prompt))
-
-        # Race between completion and tool approval
-        done_task = asyncio.ensure_future(done.wait())
-        approval_task = asyncio.ensure_future(approval_queue.get())
-
-        finished, pending_tasks = await asyncio.wait(
-            {done_task, approval_task},
-            timeout=300,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for t in pending_tasks:
-            t.cancel()
-
-        if approval_task in finished:
-            approval_info = approval_task.result()
-            # Yield any events collected so far, then the approval request
-            collected = _drain_queue(event_queue)
-            for evt in CopilotResponseConverter.to_stream_events_with_approval(
-                collected, approval_info, context
-            ):
-                yield evt
-            # Park the session for later resumption
-            self._pending_sessions[approval_info["request_id"]] = _PendingSession(
-                session=session,
-                approval_future=approval_info["future"],
-                event_queue=event_queue,
-                done_event=done,
-                approval_request_id=approval_info["request_id"],
-                permission_request=approval_info["permission_request"],
-            )
-            return
-
-        # Normal completion — yield all events
-        collected = _drain_queue(event_queue)
-        await session.destroy()
-        logger.debug(f"Stream collected {len(collected)} events")
-        for evt in CopilotResponseConverter.to_stream_events(collected, context):
-            yield evt
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _park_session_and_return_approval(
-        self, session, event_queue, done_event, approval_info, context
-    ):
-        """Store the pending session and return an incomplete response with approval request."""
-        self._pending_sessions[approval_info["request_id"]] = _PendingSession(
-            session=session,
-            approval_future=approval_info["future"],
-            event_queue=event_queue,
-            done_event=done_event,
-            approval_request_id=approval_info["request_id"],
-            permission_request=approval_info["permission_request"],
-        )
-        return CopilotResponseConverter.to_approval_request_response(
-            approval_info, context
-        )
 
     def get_trace_attributes(self):
         attrs = super().get_trace_attributes()
@@ -402,21 +289,12 @@ class CopilotAdapter(FoundryCBAgent):
         return "HostedAgent-Copilot"
 
 
-def _drain_queue(q: asyncio.Queue) -> list:
-    """Drain all items from an asyncio.Queue into a list."""
-    items = []
-    while not q.empty():
-        items.append(q.get_nowait())
-    return items
-
-
 def _collect_text(events: list) -> str:
     """Extract all assistant text from collected Copilot events.
 
     Prefers ASSISTANT_MESSAGE content, but falls back to assembling
     ASSISTANT_MESSAGE_DELTA chunks if no complete message was received.
     """
-    # Try complete messages first
     message_parts = []
     for event in events:
         if event.type == SessionEventType.ASSISTANT_MESSAGE:
@@ -425,7 +303,6 @@ def _collect_text(events: list) -> str:
     if message_parts:
         return "\n".join(message_parts)
 
-    # Fall back to deltas
     delta_parts = []
     for event in events:
         if event.type == SessionEventType.ASSISTANT_MESSAGE_DELTA:
