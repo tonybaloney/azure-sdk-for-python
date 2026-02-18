@@ -2,14 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY . user_agent/
-WORKDIR /app/user_agent
+# Copy the package source and install it
+COPY . package/
+RUN pip install ./package/ azure-identity "github-copilot-sdk>=0.1.25"
 
-RUN if [ -f requirements.txt ]; then \
-        pip install -r requirements.txt; \
-    else \
-        echo "No requirements.txt found"; \
-    fi
+# Copy the hosted agent entry point
+COPY samples/hosted_agent/main.py main.py
 
 EXPOSE 8088
 
