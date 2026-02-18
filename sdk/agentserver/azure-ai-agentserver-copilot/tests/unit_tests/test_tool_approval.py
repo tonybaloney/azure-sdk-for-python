@@ -5,7 +5,7 @@
 
 import asyncio
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -188,39 +188,36 @@ class TestHandleApprovalResponse:
             adapter._session_config = {"model": "gpt-5"}
             adapter._credential = None
             adapter._client = None
+            adapter._pending_approvals = {"req-1": {"session_id": "s1", "prompt": "x"}}
 
             ctx = _make_context()
-            approval = {"type": "mcp_approval_response", "approve": False}
+            approval = {
+                "type": "mcp_approval_response",
+                "approval_request_id": "req-1",
+                "approve": False,
+            }
             return await adapter._handle_approval_response(approval, ctx)
 
         result = asyncio.run(_run())
         d = result.as_dict()
         assert "denied" in d["output"][0]["content"][0]["text"].lower()
 
-    @patch.object(CopilotAdapter, "_run_session")
-    def test_approved_reruns_with_tools(self, mock_run_session):
-        """Approving re-runs the session with the tool pre-approved."""
-        mock_response = MagicMock()
-        mock_run_session.return_value = mock_response
-
+    def test_unknown_approval_id_returns_error(self):
         async def _run():
             adapter = CopilotAdapter.__new__(CopilotAdapter)
             adapter._session_config = {"model": "gpt-5"}
             adapter._credential = None
             adapter._client = None
+            adapter._pending_approvals = {}
 
             ctx = _make_context()
             approval = {
                 "type": "mcp_approval_response",
+                "approval_request_id": "nonexistent",
                 "approve": True,
-                "_original_prompt": "create a python script",
-                "_permission_request": {"kind": "write", "toolCallId": "tc-99"},
             }
             return await adapter._handle_approval_response(approval, ctx)
 
-        asyncio.run(_run())
-        # Should have called _run_session with approved_tools
-        mock_run_session.assert_called_once()
-        call_args = mock_run_session.call_args
-        assert call_args[0][0] == "create a python script"
-        assert call_args[1]["approved_tools"] == [{"kind": "write", "toolCallId": "tc-99"}]
+        result = asyncio.run(_run())
+        d = result.as_dict()
+        assert "no pending" in d["output"][0]["content"][0]["text"].lower()

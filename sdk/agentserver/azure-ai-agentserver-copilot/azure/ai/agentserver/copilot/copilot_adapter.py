@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
-from copilot.types import PermissionRequest, PermissionRequestResult
+from copilot.types import PermissionRequest, PermissionRequestResult, ResumeSessionConfig
 
 from azure.ai.agentserver.core.constants import Constants
 from azure.ai.agentserver.core.logger import get_logger
@@ -71,6 +71,19 @@ def _build_session_config() -> SessionConfig:
     return SessionConfig(model=os.getenv("COPILOT_MODEL", "gpt-5"))
 
 
+def _deny_handler(req: PermissionRequest, _ctx: dict) -> PermissionRequestResult:
+    """Deny permission — used on first run to capture tool requests."""
+    return PermissionRequestResult(
+        kind="denied-no-approval-rule-and-could-not-request-from-user"
+    )
+
+
+def _approve_handler(req: PermissionRequest, _ctx: dict) -> PermissionRequestResult:
+    """Approve permission — used on resumed sessions after user approval."""
+    logger.info(f"Approved tool: kind={req.get('kind')}")
+    return PermissionRequestResult(kind="approved")
+
+
 class CopilotAdapter(FoundryCBAgent):
     """Adapter that bridges a GitHub Copilot SDK session to an Azure AI Agent Server.
 
@@ -85,11 +98,14 @@ class CopilotAdapter(FoundryCBAgent):
     session can complete without hanging, but captures the request details.
     The response includes both the model's text *and* an
     ``mcp_approval_request`` output item, with ``status="incomplete"``.
+    The Copilot session is **kept alive** (not destroyed).
 
     If the caller sends a follow-up request containing an
     ``mcp_approval_response`` item with ``approve=true``, the adapter
-    re-runs the prompt in a **new** session with those specific tools
-    pre-approved.
+    **resumes** the same Copilot session (by session ID) with an
+    approve-all permission handler, and re-sends the original prompt.
+    The session already has conversation history so the model retries
+    the tool call, which is now approved.
 
     :param session_config: Override for the Copilot session config.  When
         *None* the config is built automatically from environment variables.
@@ -101,6 +117,9 @@ class CopilotAdapter(FoundryCBAgent):
         self._session_config = session_config or _build_session_config()
         self._client: Optional[CopilotClient] = None
         self._credential = None
+
+        # Map approval_request_id → {session_id, prompt, denied_requests}
+        self._pending_approvals: Dict[str, Dict[str, Any]] = {}
 
         # Keep credential for token refresh when using Foundry
         if os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL"):
@@ -153,45 +172,15 @@ class CopilotAdapter(FoundryCBAgent):
         prompt = CopilotRequestConverter(context.request).convert()
         logger.debug(f"Copilot prompt: {prompt!r}")
 
-        return await self._run_session(prompt, context, approved_tools=None)
-
-    # ------------------------------------------------------------------
-    # Core session runner
-    # ------------------------------------------------------------------
-
-    async def _run_session(
-        self,
-        prompt: str,
-        context: AgentRunContext,
-        approved_tools: Optional[List[Dict[str, Any]]],
-    ):
-        """Run a Copilot session, denying unapproved tool requests.
-
-        Tools are denied immediately (so the CLI doesn't block) and their
-        details are captured.  If any tools were denied, the response is
-        returned as ``incomplete`` with ``mcp_approval_request`` items.
-        """
         client = await self._ensure_client()
         config = self._refresh_token_if_needed()
 
-        # Track denied tool requests
+        # First run: deny all tool requests and capture them
         denied_requests: List[Dict[str, Any]] = []
 
-        # Build a set of pre-approved tool call IDs
-        approved_ids: set = set()
-        if approved_tools:
-            for t in approved_tools:
-                approved_ids.add(t.get("toolCallId", ""))
-
-        def _on_permission(
-            req: PermissionRequest, _ctx: dict,
-        ) -> PermissionRequestResult:
-            tool_call_id = req.get("toolCallId", "")
-            kind = req.get("kind", "unknown")
-            if tool_call_id in approved_ids:
-                logger.info(f"Pre-approved tool: kind={kind} id={tool_call_id}")
-                return PermissionRequestResult(kind="approved")
+        def _on_permission(req: PermissionRequest, _ctx: dict) -> PermissionRequestResult:
             request_id = str(uuid.uuid4())
+            kind = req.get("kind", "unknown")
             logger.info(f"Denied tool (needs approval): kind={kind} id={request_id}")
             denied_requests.append({
                 "request_id": request_id,
@@ -205,19 +194,7 @@ class CopilotAdapter(FoundryCBAgent):
         session = await client.create_session(session_config)
 
         try:
-            collected_events = []
-            done = asyncio.Event()
-
-            def on_event(event):
-                collected_events.append(event)
-                if event.type == SessionEventType.SESSION_IDLE:
-                    done.set()
-
-            session.on(on_event)
-            await session.send(MessageOptions(prompt=prompt))
-            await asyncio.wait_for(done.wait(), timeout=300)
-            await session.destroy()
-
+            collected_events, _ = await _send_and_collect(session, prompt)
             full_text = _collect_text(collected_events)
             logger.debug(
                 f"Session collected {len(collected_events)} events, "
@@ -226,6 +203,19 @@ class CopilotAdapter(FoundryCBAgent):
             )
 
             if denied_requests:
+                # Keep the session alive — store session ID for resume
+                session_id = session.session_id
+                for req in denied_requests:
+                    self._pending_approvals[req["request_id"]] = {
+                        "session_id": session_id,
+                        "prompt": prompt,
+                        "permission_request": req["permission_request"],
+                    }
+                logger.info(
+                    f"Parked session {session_id} with "
+                    f"{len(denied_requests)} pending approvals"
+                )
+
                 if not context.stream:
                     return CopilotResponseConverter.to_approval_request_response(
                         full_text, denied_requests, prompt, context,
@@ -234,9 +224,13 @@ class CopilotAdapter(FoundryCBAgent):
                     collected_events, denied_requests, prompt, context,
                 )
 
+            # No tools requested — normal completion, destroy session
+            await session.destroy()
             if not context.stream:
                 return CopilotResponseConverter.to_response(full_text, context)
-            return CopilotResponseConverter.to_stream_events(collected_events, context)
+            return CopilotResponseConverter.to_stream_events(
+                collected_events, context,
+            )
 
         except Exception as e:
             logger.error(f"Error during Copilot agent run: {e}")
@@ -249,26 +243,63 @@ class CopilotAdapter(FoundryCBAgent):
     async def _handle_approval_response(
         self, approval: Dict[str, Any], context: AgentRunContext,
     ):
-        """Re-run the session with the caller-approved tools."""
+        """Resume the parked session after user approval."""
         approved = approval.get("approve", False)
+        request_id = approval.get("approval_request_id", "")
+
+        pending = self._pending_approvals.pop(request_id, None)
+        if pending is None:
+            logger.warning(f"No pending session for approval_request_id={request_id}")
+            return CopilotResponseConverter.to_response(
+                "Error: no pending tool approval found for the given ID.",
+                context,
+            )
+
         if not approved:
-            logger.info("Tool denied by caller")
+            logger.info(f"Tool denied by caller: {request_id}")
             return CopilotResponseConverter.to_response(
                 "The requested tool operation was denied.", context,
             )
 
-        # Recover the original prompt stashed in the approval item
-        original_prompt = approval.get("_original_prompt")
-        if not original_prompt:
-            original_prompt = CopilotRequestConverter(context.request).convert()
+        # Resume the same Copilot session with an approve-all handler
+        session_id = pending["session_id"]
+        prompt = pending["prompt"]
+        logger.info(f"Resuming session {session_id} with approval")
 
-        approved_tool = approval.get("_permission_request")
-        approved_tools = [approved_tool] if approved_tool else []
+        client = await self._ensure_client()
+        config = self._refresh_token_if_needed()
 
-        logger.info(f"Re-running session with {len(approved_tools)} approved tools")
-        return await self._run_session(
-            original_prompt, context, approved_tools=approved_tools,
+        resume_config = ResumeSessionConfig(
+            on_permission_request=_approve_handler,
         )
+        # Inject provider config for BYOK token refresh
+        if "provider" in config:
+            resume_config["provider"] = config["provider"]
+
+        session = await client.resume_session(session_id, resume_config)
+
+        try:
+            # Re-send the same prompt — the session has history so the
+            # model knows it previously tried and was denied; now it
+            # retries and the tool is approved.
+            collected_events, _ = await _send_and_collect(session, prompt)
+            await session.destroy()
+
+            full_text = _collect_text(collected_events)
+            logger.info(
+                f"Resumed session produced {len(collected_events)} events, "
+                f"text={full_text[:100]!r}"
+            )
+
+            if not context.stream:
+                return CopilotResponseConverter.to_response(full_text, context)
+            return CopilotResponseConverter.to_stream_events(
+                collected_events, context,
+            )
+
+        except Exception as e:
+            logger.error(f"Error resuming session {session_id}: {e}")
+            raise
 
     # ------------------------------------------------------------------
     # Trace / identity
@@ -287,6 +318,22 @@ class CopilotAdapter(FoundryCBAgent):
         if agent_id:
             return agent_id
         return "HostedAgent-Copilot"
+
+
+async def _send_and_collect(session, prompt: str):
+    """Send a message and collect all events until SESSION_IDLE."""
+    collected = []
+    done = asyncio.Event()
+
+    def on_event(event):
+        collected.append(event)
+        if event.type == SessionEventType.SESSION_IDLE:
+            done.set()
+
+    session.on(on_event)
+    await session.send(MessageOptions(prompt=prompt))
+    await asyncio.wait_for(done.wait(), timeout=300)
+    return collected, done
 
 
 def _collect_text(events: list) -> str:
