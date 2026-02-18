@@ -55,7 +55,7 @@ class TestBuildSessionConfig:
         assert config["model"] == "gpt-4.1"
         assert config["provider"]["type"] == "openai"
         assert config["provider"]["base_url"] == "https://myresource.openai.azure.com/openai/v1/"
-        assert config["provider"]["api_key"] == "fake-token-123"
+        assert config["provider"]["bearer_token"] == "fake-token-123"
         assert config["provider"]["wire_api"] == "responses"
         mock_cred.get_token.assert_called_once_with("https://cognitiveservices.azure.com/.default")
 
@@ -101,14 +101,14 @@ class TestTokenRefresh:
     """Tests for _refresh_token_if_needed()."""
 
     @patch("azure.ai.agentserver.copilot.copilot_adapter._build_session_config")
-    def test_refresh_updates_api_key(self, mock_build):
-        """Token refresh replaces the api_key in the provider config."""
+    def test_refresh_updates_bearer_token(self, mock_build):
+        """Token refresh replaces the bearer_token in the provider config."""
         mock_build.return_value = {
             "model": "gpt-4.1",
             "provider": {
                 "type": "openai",
                 "base_url": "https://x.openai.azure.com/openai/v1/",
-                "api_key": "old-token",
+                "bearer_token": "old-token",
                 "wire_api": "responses",
             },
         }
@@ -125,7 +125,7 @@ class TestTokenRefresh:
 
             config = adapter._refresh_token_if_needed()
 
-        assert config["provider"]["api_key"] == "new-token-456"
+        assert config["provider"]["bearer_token"] == "new-token-456"
 
     @patch("azure.ai.agentserver.copilot.copilot_adapter._build_session_config")
     def test_no_refresh_without_credential(self, mock_build):

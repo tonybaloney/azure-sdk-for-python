@@ -60,7 +60,7 @@ def _build_session_config() -> SessionConfig:
             provider=ProviderConfig(
                 type="openai",
                 base_url=base_url,
-                api_key=token,
+                bearer_token=token,
                 wire_api="responses",
             ),
         )
@@ -100,7 +100,7 @@ class CopilotAdapter(FoundryCBAgent):
 
         token = self._credential.get_token(_COGNITIVE_SERVICES_SCOPE).token
         # Rebuild provider with fresh token
-        self._session_config["provider"]["api_key"] = token
+        self._session_config["provider"]["bearer_token"] = token
         return self._session_config
 
     async def _ensure_client(self) -> CopilotClient:
