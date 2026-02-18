@@ -1,3 +1,4 @@
 azure-ai-agentserver-copilot
+azure-identity
 github-copilot-sdk>=0.1.25
 python-dotenv

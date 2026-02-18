@@ -95,7 +95,7 @@ class CopilotAdapter(FoundryCBAgent):
 
     def _refresh_token_if_needed(self) -> SessionConfig:
         """Return the session config, refreshing the bearer token if using Foundry."""
-        if self._credential is None:
+        if self._credential is None or "provider" not in self._session_config:
             return self._session_config
 
         token = self._credential.get_token(_COGNITIVE_SERVICES_SCOPE).token
