@@ -64,7 +64,7 @@ class CopilotResponseConverter:
         """
         item_id = context.id_generator.generate_message_id()
 
-        yield ResponseCreatedEvent(response=OpenAIResponse(output=[]))
+        yield ResponseCreatedEvent(response=OpenAIResponse(id=context.response_id, output=[]))
         yield ResponseOutputItemAddedEvent(
             output_index=0,
             item=ResponsesAssistantMessageItemResource(
