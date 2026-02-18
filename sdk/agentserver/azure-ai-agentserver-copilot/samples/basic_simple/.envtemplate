@@ -1,0 +1,4 @@
+# No extra environment variables are required.
+# The Copilot CLI is discovered automatically from $PATH.
+# Optionally set:
+# COPILOT_CLI_PATH=/path/to/copilot

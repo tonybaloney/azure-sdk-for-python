@@ -1,0 +1,13 @@
+{
+    "ignoreWords": [
+      "azureai",
+      "copilot",
+      "envtemplate"
+    ],
+    "ignorePaths": [
+      "*.csv",
+      "*.json",
+      "*.rst",
+      "**/samples/**"
+    ]
+  }
