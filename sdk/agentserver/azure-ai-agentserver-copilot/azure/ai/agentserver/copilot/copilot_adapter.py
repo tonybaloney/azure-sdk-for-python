@@ -141,13 +141,8 @@ class CopilotAdapter(FoundryCBAgent):
         await asyncio.wait_for(done.wait(), timeout=300)
         await session.destroy()
 
-        # Extract final text from collected events
-        text_parts = []
-        for event in collected_events:
-            if event.type == SessionEventType.ASSISTANT_MESSAGE:
-                if event.data and hasattr(event.data, "content") and event.data.content:
-                    text_parts.append(event.data.content)
-        full_text = "\n".join(text_parts) if text_parts else ""
+        full_text = _collect_text(collected_events)
+        logger.debug(f"Non-stream collected {len(collected_events)} events, text length={len(full_text)}")
 
         return CopilotResponseConverter.to_response(full_text, context)
 
@@ -166,6 +161,8 @@ class CopilotAdapter(FoundryCBAgent):
         await asyncio.wait_for(done.wait(), timeout=300)
         await session.destroy()
 
+        logger.debug(f"Stream collected {len(collected_events)} events")
+
         # Convert collected events to streaming events
         return CopilotResponseConverter.to_stream_events(collected_events, context)
 
@@ -182,3 +179,27 @@ class CopilotAdapter(FoundryCBAgent):
         if agent_id:
             return agent_id
         return "HostedAgent-Copilot"
+
+
+def _collect_text(events: list) -> str:
+    """Extract all assistant text from collected Copilot events.
+
+    Prefers ASSISTANT_MESSAGE content, but falls back to assembling
+    ASSISTANT_MESSAGE_DELTA chunks if no complete message was received.
+    """
+    # Try complete messages first
+    message_parts = []
+    for event in events:
+        if event.type == SessionEventType.ASSISTANT_MESSAGE:
+            if event.data and hasattr(event.data, "content") and event.data.content:
+                message_parts.append(event.data.content)
+    if message_parts:
+        return "\n".join(message_parts)
+
+    # Fall back to deltas
+    delta_parts = []
+    for event in events:
+        if event.type == SessionEventType.ASSISTANT_MESSAGE_DELTA:
+            if event.data and hasattr(event.data, "content") and event.data.content:
+                delta_parts.append(event.data.content)
+    return "".join(delta_parts)
