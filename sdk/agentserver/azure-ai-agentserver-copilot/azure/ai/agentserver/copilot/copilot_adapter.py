@@ -8,6 +8,7 @@ from typing import Optional
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
+from copilot.types import PermissionRequest, PermissionRequestResult
 
 from azure.ai.agentserver.core.constants import Constants
 from azure.ai.agentserver.core.logger import get_logger
@@ -117,7 +118,15 @@ class CopilotAdapter(FoundryCBAgent):
 
         client = await self._ensure_client()
         config = self._refresh_token_if_needed()
-        session = await client.create_session(config)
+
+        # Auto-approve tool calls — the hosted agent runs in a sandboxed
+        # container so file writes and shell commands are safe.
+        def _auto_approve(req: PermissionRequest, _ctx: dict) -> PermissionRequestResult:
+            logger.info(f"Auto-approving tool: kind={req.get('kind')} intention={req.get('intention', '')}")
+            return PermissionRequestResult(kind="approved")
+
+        session_config = SessionConfig(**config, on_permission_request=_auto_approve)
+        session = await client.create_session(session_config)
         try:
             if not context.stream:
                 return await self._run_non_stream(session, prompt, context)
