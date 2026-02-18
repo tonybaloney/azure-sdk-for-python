@@ -2,6 +2,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # ---------------------------------------------------------
 # pylint: disable=logging-fstring-interpolation,broad-exception-caught
+import asyncio
 import os
 from typing import Optional
 
@@ -48,15 +49,13 @@ class CopilotAdapter(FoundryCBAgent):
         try:
             if not context.stream:
                 return await self._run_non_stream(session, prompt, context)
-            return self._run_stream(session, prompt, context)
+            return await self._run_stream(session, prompt, context)
         except Exception as e:
             logger.error(f"Error during Copilot agent run: {e}")
             raise
 
     async def _run_non_stream(self, session, prompt: str, context: AgentRunContext):
         """Execute a non-streaming request and return a single Response."""
-        import asyncio
-
         collected_events = []
         done = asyncio.Event()
 
@@ -82,8 +81,6 @@ class CopilotAdapter(FoundryCBAgent):
 
     async def _run_stream(self, session, prompt: str, context: AgentRunContext):
         """Execute a streaming request, yielding ResponseStreamEvent objects."""
-        import asyncio
-
         collected_events = []
         done = asyncio.Event()
 
