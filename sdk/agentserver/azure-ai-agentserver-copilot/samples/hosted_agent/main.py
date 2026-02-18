@@ -28,21 +28,20 @@ Usage
 
 Environment variables
 ---------------------
-COPILOT_MODEL   Model to use for Copilot sessions (default: gpt-5).
+AZURE_AI_FOUNDRY_RESOURCE_URL
+    Azure AI Foundry resource URL (e.g. https://<name>.openai.azure.com).
+    When set, the adapter uses Foundry models via BYOK with Managed Identity.
+COPILOT_MODEL
+    Model deployment name (default: gpt-4.1 for Foundry, gpt-5 for GitHub).
 """
 
 import asyncio
-import os
-
-from copilot import SessionConfig
 
 from azure.ai.agentserver.copilot import from_copilot
 
-MODEL = os.getenv("COPILOT_MODEL", "gpt-5")
-
 
 async def main() -> None:
-    agent = from_copilot(SessionConfig(model=MODEL))
+    agent = from_copilot()
     await agent.run_async()
 
 
