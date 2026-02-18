@@ -36,13 +36,8 @@ class TestBuildSessionConfig:
             config = _build_session_config()
             assert config["model"] == "gpt-4.1"
 
-    @patch("azure.identity.DefaultAzureCredential")
-    def test_byok_foundry_mode(self, mock_cred_cls):
-        """With AZURE_AI_FOUNDRY_RESOURCE_URL, builds BYOK ProviderConfig."""
-        mock_cred = MagicMock()
-        mock_cred.get_token.return_value = MagicMock(token="fake-token-123")
-        mock_cred_cls.return_value = mock_cred
-
+    def test_byok_foundry_mode(self):
+        """With AZURE_AI_FOUNDRY_RESOURCE_URL, builds BYOK ProviderConfig with placeholder token."""
         env = {
             "AZURE_AI_FOUNDRY_RESOURCE_URL": "https://myresource.openai.azure.com",
             "COPILOT_MODEL": "gpt-4.1",
@@ -55,9 +50,8 @@ class TestBuildSessionConfig:
         assert config["model"] == "gpt-4.1"
         assert config["provider"]["type"] == "openai"
         assert config["provider"]["base_url"] == "https://myresource.openai.azure.com/openai/v1/"
-        assert config["provider"]["bearer_token"] == "fake-token-123"
+        assert config["provider"]["bearer_token"] == "placeholder"
         assert config["provider"]["wire_api"] == "responses"
-        mock_cred.get_token.assert_called_once_with("https://cognitiveservices.azure.com/.default")
 
     @patch("azure.identity.DefaultAzureCredential")
     def test_byok_trailing_slash_stripped(self, mock_cred_cls):

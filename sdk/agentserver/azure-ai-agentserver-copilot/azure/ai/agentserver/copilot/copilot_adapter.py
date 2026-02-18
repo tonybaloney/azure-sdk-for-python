@@ -28,10 +28,10 @@ def _build_session_config() -> SessionConfig:
     """Build a SessionConfig from environment variables.
 
     When ``AZURE_AI_FOUNDRY_RESOURCE_URL`` is set the adapter runs in
-    **BYOK mode** against Azure AI Foundry.  A short-lived bearer token
-    is obtained via ``DefaultAzureCredential`` (supports Managed Identity,
-    Azure CLI, etc.) and injected as ``bearer_token`` in the provider
-    config.
+    **BYOK mode** against Azure AI Foundry.  The bearer token is **not**
+    acquired here — it is populated lazily by
+    ``_refresh_token_if_needed()`` before each session to avoid startup
+    failures when Managed Identity is not yet available.
 
     Environment variables
     ---------------------
@@ -42,18 +42,13 @@ def _build_session_config() -> SessionConfig:
     COPILOT_MODEL
         Model deployment name (default ``gpt-4.1``).
 
-    :return: A ready-to-use SessionConfig.
+    :return: A ready-to-use SessionConfig (token placeholder until refresh).
     :rtype: SessionConfig
     """
     foundry_url = os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL")
     model = os.getenv("COPILOT_MODEL", "gpt-4.1")
 
     if foundry_url:
-        from azure.identity import DefaultAzureCredential
-
-        credential = DefaultAzureCredential()
-        token = credential.get_token(_COGNITIVE_SERVICES_SCOPE).token
-
         base_url = foundry_url.rstrip("/") + "/openai/v1/"
         logger.info(f"BYOK mode: using Azure AI Foundry at {base_url}")
 
@@ -62,7 +57,7 @@ def _build_session_config() -> SessionConfig:
             provider=ProviderConfig(
                 type="openai",
                 base_url=base_url,
-                bearer_token=token,
+                bearer_token="placeholder",  # refreshed before first use
                 wire_api="responses",
             ),
         )
@@ -332,7 +327,7 @@ async def _send_and_collect(session, prompt: str):
 
     session.on(on_event)
     await session.send(MessageOptions(prompt=prompt))
-    await asyncio.wait_for(done.wait(), timeout=300)
+    await asyncio.wait_for(done.wait(), timeout=120)
     return collected, done
 
 
