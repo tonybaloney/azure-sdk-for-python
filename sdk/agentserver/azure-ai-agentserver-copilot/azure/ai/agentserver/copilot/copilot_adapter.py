@@ -28,30 +28,48 @@ def _build_session_config() -> SessionConfig:
     """Build a SessionConfig from environment variables.
 
     When ``AZURE_AI_FOUNDRY_RESOURCE_URL`` is set the adapter runs in
-    **BYOK mode** against Azure AI Foundry.  The bearer token is **not**
-    acquired here — it is populated lazily by
-    ``_refresh_token_if_needed()`` before each session to avoid startup
-    failures when Managed Identity is not yet available.
+    **BYOK mode** against Azure AI Foundry.
+
+    Authentication priority:
+    1. ``AZURE_AI_FOUNDRY_API_KEY`` — static API key (easiest for local dev)
+    2. ``DefaultAzureCredential`` — Managed Identity / Azure CLI (for prod)
+
+    When using an API key the token is set once at startup.  When using
+    ``DefaultAzureCredential`` the bearer token starts as a placeholder and
+    is refreshed lazily by ``_refresh_token_if_needed()`` before each
+    session.
 
     Environment variables
     ---------------------
     AZURE_AI_FOUNDRY_RESOURCE_URL
         The Azure AI Foundry resource URL, e.g.
-        ``https://<resource>.openai.azure.com``.  When set, BYOK mode is
-        activated.
+        ``https://<resource>.cognitiveservices.azure.com``.
+    AZURE_AI_FOUNDRY_API_KEY
+        Static API key for the Foundry resource.  If set, takes priority
+        over ``DefaultAzureCredential``.
     COPILOT_MODEL
         Model deployment name (default ``gpt-4.1``).
-
-    :return: A ready-to-use SessionConfig (token placeholder until refresh).
-    :rtype: SessionConfig
     """
     foundry_url = os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL")
     model = os.getenv("COPILOT_MODEL", "gpt-4.1")
 
     if foundry_url:
         base_url = foundry_url.rstrip("/") + "/openai/v1/"
-        logger.info(f"BYOK mode: using Azure AI Foundry at {base_url}")
+        api_key = os.getenv("AZURE_AI_FOUNDRY_API_KEY")
 
+        if api_key:
+            logger.info(f"BYOK mode (API key): {base_url}")
+            return SessionConfig(
+                model=model,
+                provider=ProviderConfig(
+                    type="openai",
+                    base_url=base_url,
+                    bearer_token=api_key,
+                    wire_api="responses",
+                ),
+            )
+
+        logger.info(f"BYOK mode (Managed Identity): {base_url}")
         return SessionConfig(
             model=model,
             provider=ProviderConfig(
@@ -116,8 +134,8 @@ class CopilotAdapter(FoundryCBAgent):
         # Map approval_request_id → {session_id, prompt, denied_requests}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
 
-        # Keep credential for token refresh when using Foundry
-        if os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL"):
+        # Keep credential for token refresh when using Foundry with Managed Identity
+        if os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL") and not os.getenv("AZURE_AI_FOUNDRY_API_KEY"):
             from azure.identity import DefaultAzureCredential
 
             self._credential = DefaultAzureCredential()
@@ -316,12 +334,32 @@ class CopilotAdapter(FoundryCBAgent):
 
 
 async def _send_and_collect(session, prompt: str):
-    """Send a message and collect all events until SESSION_IDLE."""
+    """Send a message and collect all events until SESSION_IDLE.
+
+    The Copilot SDK sometimes emits duplicate events (especially after
+    ``resume_session``).  We deduplicate by tracking seen
+    ``(event_type, content)`` pairs.
+    """
     collected = []
+    seen = set()
     done = asyncio.Event()
 
     def on_event(event):
+        # Build a dedup key from type + content (if any)
+        text = ""
+        if event.data and hasattr(event.data, "content") and event.data.content:
+            text = event.data.content
+        key = (event.type, text)
+        if key in seen:
+            logger.debug(f"Skipping duplicate event: {event.type}")
+            return
+        seen.add(key)
+
         collected.append(event)
+        logger.debug(
+            f"Event: {event.type} data_type={type(event.data).__name__} "
+            f"text={text[:80]!r}"
+        )
         if event.type == SessionEventType.SESSION_IDLE:
             done.set()
 
@@ -332,7 +370,7 @@ async def _send_and_collect(session, prompt: str):
 
 
 def _collect_text(events: list) -> str:
-    """Extract all assistant text from collected Copilot events.
+    """Extract assistant text from collected Copilot events.
 
     Prefers ASSISTANT_MESSAGE content, but falls back to assembling
     ASSISTANT_MESSAGE_DELTA chunks if no complete message was received.

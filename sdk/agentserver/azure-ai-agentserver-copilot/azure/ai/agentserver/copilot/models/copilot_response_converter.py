@@ -29,8 +29,14 @@ class CopilotResponseConverter:
 
     @staticmethod
     def to_response(text: str, context: AgentRunContext) -> OpenAIResponse:
-        """Build a non-streaming OpenAI Response from the final assistant text."""
+        """Build a non-streaming OpenAI Response from the final assistant text.
+
+        If *text* is empty, a fallback message is used so the response is
+        never blank.
+        """
         item_id = context.id_generator.generate_message_id()
+        if not text.strip():
+            text = "(No response text was produced by the agent.)"
         return OpenAIResponse(
             id=context.response_id,
             created_at=datetime.datetime.now(),
@@ -121,6 +127,12 @@ class CopilotResponseConverter:
                 yield ResponseTextDeltaEvent(
                     output_index=0, content_index=0, delta=text,
                 )
+
+        if not assembled.strip():
+            assembled = "(No response text was produced by the agent.)"
+            yield ResponseTextDeltaEvent(
+                output_index=0, content_index=0, delta=assembled,
+            )
 
         yield ResponseTextDoneEvent(
             output_index=0, content_index=0, text=assembled,

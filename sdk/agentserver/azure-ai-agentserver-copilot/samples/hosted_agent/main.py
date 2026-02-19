@@ -29,8 +29,11 @@ Usage
 Environment variables
 ---------------------
 AZURE_AI_FOUNDRY_RESOURCE_URL
-    Azure AI Foundry resource URL (e.g. https://<name>.openai.azure.com).
-    When set, the adapter uses Foundry models via BYOK with Managed Identity.
+    Azure AI Foundry resource URL (e.g. https://<name>.cognitiveservices.azure.com).
+    When set, the adapter uses Foundry models via BYOK.
+AZURE_AI_FOUNDRY_API_KEY
+    Static API key for the Foundry resource (for local dev). If not set,
+    falls back to DefaultAzureCredential (Managed Identity / Azure CLI).
 COPILOT_MODEL
     Model deployment name (default: gpt-4.1 for Foundry, gpt-5 for GitHub).
 """
