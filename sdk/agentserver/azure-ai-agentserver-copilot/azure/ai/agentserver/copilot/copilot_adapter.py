@@ -336,24 +336,27 @@ class CopilotAdapter(FoundryCBAgent):
 async def _send_and_collect(session, prompt: str):
     """Send a message and collect all events until SESSION_IDLE.
 
-    The Copilot SDK sometimes emits duplicate events (especially after
-    ``resume_session``).  We deduplicate by tracking seen
-    ``(event_type, content)`` pairs.
+    The Copilot SDK emits every event twice after ``resume_session``.
+    These duplicates are always **consecutive**, so we skip an event
+    only when it is identical to the immediately preceding one.
     """
     collected = []
-    seen = set()
+    last_key = None
     done = asyncio.Event()
 
     def on_event(event):
-        # Build a dedup key from type + content (if any)
+        nonlocal last_key
+        # Build a dedup key from type + content
         text = ""
         if event.data and hasattr(event.data, "content") and event.data.content:
             text = event.data.content
         key = (event.type, text)
-        if key in seen:
-            logger.debug(f"Skipping duplicate event: {event.type}")
+
+        # Skip only consecutive duplicates (resume_session replay artefact)
+        if key == last_key:
+            logger.debug(f"Skipping consecutive duplicate: {event.type}")
             return
-        seen.add(key)
+        last_key = key
 
         collected.append(event)
         logger.debug(
