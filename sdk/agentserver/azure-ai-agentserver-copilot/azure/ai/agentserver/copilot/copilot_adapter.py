@@ -4,6 +4,7 @@
 # pylint: disable=logging-fstring-interpolation,broad-exception-caught
 import asyncio
 import dataclasses
+import json
 import os
 import uuid
 from typing import Any, Dict, List, Optional
@@ -20,6 +21,13 @@ from azure.ai.agentserver.core.server.common.agent_run_context import AgentRunCo
 
 from .models.copilot_request_converter import CopilotRequestConverter
 from .models.copilot_response_converter import CopilotResponseConverter, CopilotStreamingResponseConverter
+
+from azure.ai.agentserver.core.models import Response as _RespModel
+from azure.ai.agentserver.core.models.projects import (
+    MCPApprovalRequestItemResource,
+    ResponseIncompleteEvent,
+    ResponseOutputItemAddedEvent as _ROIAddedEvent,
+)
 
 logger = get_logger()
 
@@ -197,7 +205,7 @@ class CopilotAdapter(FoundryCBAgent):
 
         # Streaming: return an async generator so events flow to the client
         # immediately as the Copilot SDK emits them — no wait-until-idle.
-        return self._run_streaming(session, prompt, context, tracer, span_attrs)
+        return self._run_streaming(session, prompt, context, tracer, span_attrs, denied_requests)
 
     async def _run_streaming(
         self,
@@ -206,6 +214,7 @@ class CopilotAdapter(FoundryCBAgent):
         context: AgentRunContext,
         tracer: Any,
         span_attrs: Dict[str, Any],
+        denied_requests: List[Dict[str, Any]],
     ):
         """Async generator: converts Copilot events → RAPI stream events on-the-fly.
 
@@ -235,6 +244,35 @@ class CopilotAdapter(FoundryCBAgent):
                     if data.output_tokens is not None:
                         span.set_attribute("gen_ai.usage.output_tokens", int(data.output_tokens))
                 # Yield RAPI events immediately — 0..N per Copilot event
+                # When the first ASSISTANT_TURN_END arrives and tools were denied,
+                # stop the normal flow and emit approval request + incomplete instead.
+                if copilot_event.type == SessionEventType.ASSISTANT_TURN_END and denied_requests:
+                    for i, denied in enumerate(denied_requests):
+                        req = denied["permission_request"]
+                        approval_item = MCPApprovalRequestItemResource(
+                            id=denied["request_id"],
+                            server_label="copilot-cli",
+                            name=req.get("kind", "unknown"),
+                            arguments=json.dumps({k: v for k, v in req.items() if k != "kind"}),
+                        )
+                        yield _ROIAddedEvent(
+                            sequence_number=converter.next_sequence(),
+                            output_index=i,
+                            item=approval_item,
+                        )
+                    yield ResponseIncompleteEvent(
+                        sequence_number=converter.next_sequence(),
+                        response=_RespModel(id=context.response_id, status="incomplete", output=[
+                            MCPApprovalRequestItemResource(
+                                id=d["request_id"],
+                                server_label="copilot-cli",
+                                name=d["permission_request"].get("kind", "unknown"),
+                                arguments=json.dumps({k: v for k, v in d["permission_request"].items() if k != "kind"}),
+                            ) for d in denied_requests
+                        ]),
+                    )
+                    span.set_attribute("gen_ai.response.finish_reasons", ["tool_approval_required"])
+                    return
                 for rapi_event in converter._convert_event(copilot_event, context, item_id):
                     yield rapi_event
             span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
