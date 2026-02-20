@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
 from copilot.types import PermissionRequest, PermissionRequestResult, ResumeSessionConfig
+from opentelemetry import trace
 
 from azure.ai.agentserver.core.constants import Constants
 from azure.ai.agentserver.core.logger import get_logger
@@ -172,23 +173,59 @@ class CopilotAdapter(FoundryCBAgent):
         else:
             logger.info(f"Reusing Copilot session {session.session_id!r} for conversation turn (conversation={conversation_id!r})")
 
+        tracer = self.tracer or trace.get_tracer(__name__)
+        agent_name = self.get_agent_identifier()
+        request_model = config.get("model", "") if hasattr(config, "get") else ""
+
+        span_attrs: Dict[str, Any] = {
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.provider.name": "github.copilot",
+            "gen_ai.agent.id": "copilot",
+            "gen_ai.agent.name": agent_name,
+            "gen_ai.request.model": request_model,
+        }
+        if conversation_id:
+            span_attrs["gen_ai.conversation.id"] = conversation_id
+
+        collected_events: list = []
         try:
-            collected_events = await _send_and_collect(session, prompt)
+            with tracer.start_as_current_span(
+                name=f"invoke_agent {agent_name}",
+                kind=trace.SpanKind.CLIENT,
+                attributes=span_attrs,
+            ) as span:
+                try:
+                    collected_events = await _send_and_collect(session, prompt)
 
-            # Session intentionally kept alive for multi-turn conversations.
-            # It will be evicted from _sessions when the client explicitly ends
-            # the conversation or the process restarts.
-            if not context.stream:
-                # Non-streaming support is a dumb idea. IMO this should yield a not-supported-exception.
-                return CopilotResponseConverter.to_response("", context)
-            response_converter = CopilotStreamingResponseConverter(context)
-            return response_converter.to_stream_events(
-                collected_events, context,
-            )
+                    # Enrich span with usage from ASSISTANT_USAGE event
+                    for event in collected_events:
+                        if event.type == SessionEventType.ASSISTANT_USAGE and event.data:
+                            if event.data.model:
+                                span.set_attribute("gen_ai.response.model", event.data.model)
+                            if event.data.input_tokens is not None:
+                                span.set_attribute("gen_ai.usage.input_tokens", int(event.data.input_tokens))
+                            if event.data.output_tokens is not None:
+                                span.set_attribute("gen_ai.usage.output_tokens", int(event.data.output_tokens))
+                            break
+                    span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
 
+                except Exception as e:
+                    span.set_attribute("error.type", type(e).__name__)
+                    raise
         except Exception as e:
             logger.error(f"Error during Copilot agent run: {e}")
             raise
+
+        # Session intentionally kept alive for multi-turn conversations.
+        # It will be evicted from _sessions when the client explicitly ends
+        # the conversation or the process restarts.
+        if not context.stream:
+            # Non-streaming support is a dumb idea. IMO this should yield a not-supported-exception.
+            return CopilotResponseConverter.to_response("", context)
+        response_converter = CopilotStreamingResponseConverter(context)
+        return response_converter.to_stream_events(
+            collected_events, context,
+        )
 
     def get_trace_attributes(self):
         attrs = super().get_trace_attributes()
