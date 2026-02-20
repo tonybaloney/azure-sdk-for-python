@@ -12,6 +12,8 @@ from azure.ai.agentserver.core.models.projects import (
     ItemContentOutputText,
     MCPApprovalRequestItemResource,
     ResponseCompletedEvent,
+    ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
     ResponseIncompleteEvent,
     ResponseOutputItemAddedEvent,
@@ -22,6 +24,10 @@ from azure.ai.agentserver.core.models.projects import (
     ResponseTextDoneEvent,
 )
 from azure.ai.agentserver.core.server.common.agent_run_context import AgentRunContext
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class CopilotResponseConverter:
@@ -51,63 +57,185 @@ class CopilotResponseConverter:
 
 
 class CopilotStreamingResponseConverter:
-    """Converts Copilot SDK session events into OpenAI-format responses."""
+    """Converts Copilot SDK session events into OpenAI-format streaming response events.
+
+    Event mapping (based on observed GitHub Copilot SDK event flow):
+
+    Copilot event                  RAPI events emitted
+    ─────────────────────────────  ──────────────────────────────────────────────────────
+    ASSISTANT_TURN_START           response.created
+                                   response.output_item.added  (assistant message item)
+                                   response.content_part.added (output_text part)
+    ASSISTANT_MESSAGE_DELTA        response.output_text.delta
+                                   (may not fire for all models; content may arrive in
+                                    one shot via ASSISTANT_MESSAGE instead)
+    ASSISTANT_MESSAGE              response.output_text.delta  (if no prior deltas)
+                                   response.output_text.done
+                                   response.content_part.done
+                                   response.output_item.done
+    ASSISTANT_TURN_END             response.completed
+    ASSISTANT_REASONING            (logged only; no RAPI event — not in spec yet)
+    everything else                (ignored)
+    """
 
     def __init__(self, context: AgentRunContext):
         self.context = context
-        # sequence numbers must start at 0 for first emitted event. Counter is incremented in next_sequence() before being assigned to event, so it starts at -1 here.
+        # Sequence numbers start at -1; next_sequence() pre-increments before use.
         self._sequence = -1
-        self._response_id = None
-        self._response_created_at = None
-        self._next_output_index = 0
+        # Text accumulated from deltas so we can detect when ASSISTANT_MESSAGE
+        # arrives without prior deltas and synthesise a single delta for it.
+        self._accumulated_text: str = ""
+        # The completed assistant message item built during ASSISTANT_MESSAGE;
+        # stored so ASSISTANT_TURN_END can embed it in ResponseCompletedEvent.
+        self._completed_item: Optional[ResponsesAssistantMessageItemResource] = None
 
     def next_sequence(self) -> int:
         self._sequence += 1
         return self._sequence
 
-    def as_response_stream_event(self, event: SessionEvent, context: AgentRunContext, item_id: str) -> ResponseStreamEvent | None:
-        """Convert a single SessionEvent into a ResponseStreamEvent, if possible."""
-        match event:
-            case SessionEvent(type=SessionEventType.SESSION_START, data=data):
-                return ResponseCreatedEvent(
-                    sequence_number=self.next_sequence(),
-                    item_id=item_id,
-                    response=OpenAIResponse(
-                        id=context.response_id, 
-                        status="in_progress",
-                        ),
-                )
-            case SessionEvent(type=SessionEventType.SESSION_SHUTDOWN, data=data):
-                return ResponseCompletedEvent(
-                    sequence_number=self.next_sequence(),
-                    item_id=item_id,
-                    response=OpenAIResponse(
-                        id=context.response_id, 
-                        status="completed",
-                        ),
-                )
-            case SessionEvent(type=SessionEventType.ASSISTANT_MESSAGE_DELTA, data=data) if data and hasattr(data, "content"):
-                return ResponseTextDeltaEvent(
-                    sequence_number=self.next_sequence(),
-                    item_id=item_id,
-                    delta=data.content,
-                )
-            case SessionEvent(type=SessionEventType.ASSISTANT_MESSAGE, data=data) if data and hasattr(data, "content"):
-                return ResponseTextDoneEvent(
-                    sequence_number=self.next_sequence(),
-                    item_id=item_id,
-                    text=data.content,
-                )
-            
-        return None
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def to_stream_events(
-            self, events: list[SessionEvent], context: AgentRunContext,
+        self, events: list[SessionEvent], context: AgentRunContext,
     ) -> Generator[ResponseStreamEvent, None, None]:
-        """Convert a batch of Copilot SessionEvents into streaming response events."""
+        """Convert a collected batch of Copilot SessionEvents into RAPI stream events."""
         item_id = context.id_generator.generate_message_id()
-
         for event in events:
-            stream_event = self.as_response_stream_event(event, context, item_id=item_id)
-            if stream_event is not None:
-                yield stream_event
+            yield from self._convert_event(event, context, item_id)
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _convert_event(
+        self, event: SessionEvent, context: AgentRunContext, item_id: str,
+    ) -> Generator[ResponseStreamEvent, None, None]:
+        """Yield zero or more RAPI ResponseStreamEvents for a single Copilot session event."""
+
+        match event:
+
+            # ── Turn start ────────────────────────────────────────────────────
+            case SessionEvent(type=SessionEventType.ASSISTANT_TURN_START):
+                # response.created
+                yield ResponseCreatedEvent(
+                    sequence_number=self.next_sequence(),
+                    response=OpenAIResponse(id=context.response_id, status="in_progress"),
+                )
+                # response.output_item.added  (empty assistant item, will be filled later)
+                yield ResponseOutputItemAddedEvent(
+                    sequence_number=self.next_sequence(),
+                    output_index=0,
+                    item=ResponsesAssistantMessageItemResource(
+                        id=item_id,
+                        status="in_progress",
+                        content=[],
+                    ),
+                )
+                # response.content_part.added  (empty text part)
+                yield ResponseContentPartAddedEvent(
+                    sequence_number=self.next_sequence(),
+                    item_id=item_id,
+                    output_index=0,
+                    content_index=0,
+                    part=ItemContentOutputText(text="", annotations=[]),
+                )
+
+            # ── Streaming text delta ──────────────────────────────────────────
+            case SessionEvent(type=SessionEventType.ASSISTANT_MESSAGE_DELTA, data=data) if data and data.content:
+                self._accumulated_text += data.content
+                yield ResponseTextDeltaEvent(
+                    sequence_number=self.next_sequence(),
+                    item_id=item_id,
+                    output_index=0,
+                    content_index=0,
+                    delta=data.content,
+                )
+
+            # ── Full assistant message ────────────────────────────────────────
+            case SessionEvent(type=SessionEventType.ASSISTANT_MESSAGE, data=data) if data and data.content:
+                text = data.content
+
+                # If no deltas arrived (e.g. Claude returns all at once), emit
+                # a synthetic delta now so clients get at least one delta event.
+                if not self._accumulated_text:
+                    self._accumulated_text = text
+                    yield ResponseTextDeltaEvent(
+                        sequence_number=self.next_sequence(),
+                        item_id=item_id,
+                        output_index=0,
+                        content_index=0,
+                        delta=text,
+                    )
+
+                # response.output_text.done
+                yield ResponseTextDoneEvent(
+                    sequence_number=self.next_sequence(),
+                    item_id=item_id,
+                    output_index=0,
+                    content_index=0,
+                    text=text,
+                )
+
+                # Build the completed item now so ASSISTANT_TURN_END can embed it.
+                self._completed_item = ResponsesAssistantMessageItemResource(
+                    id=item_id,
+                    status="completed",
+                    content=[ItemContentOutputText(text=text, annotations=[])],
+                )
+
+                # response.content_part.done
+                yield ResponseContentPartDoneEvent(
+                    sequence_number=self.next_sequence(),
+                    item_id=item_id,
+                    output_index=0,
+                    content_index=0,
+                    part=ItemContentOutputText(text=text, annotations=[]),
+                )
+
+                # response.output_item.done
+                yield ResponseOutputItemDoneEvent(
+                    sequence_number=self.next_sequence(),
+                    output_index=0,
+                    item=self._completed_item,
+                )
+
+            # ── Turn end ──────────────────────────────────────────────────────
+            case SessionEvent(type=SessionEventType.ASSISTANT_TURN_END):
+                output = [self._completed_item] if self._completed_item else []
+                yield ResponseCompletedEvent(
+                    sequence_number=self.next_sequence(),
+                    response=OpenAIResponse(
+                        id=context.response_id,
+                        status="completed",
+                        output=output,
+                    ),
+                )
+
+            # ── Reasoning (extended thinking) ─────────────────────────────────
+            case SessionEvent(type=SessionEventType.ASSISTANT_REASONING, data=data):
+                # Not yet part of the standard RAPI spec; log and skip.
+                if data and data.content:
+                    logger.debug(f"Copilot reasoning (skipped): {data.content[:120]!r}")
+
+            # ── All other events ──────────────────────────────────────────────
+            case _:
+                ename = event.type.name if event.type else "UNKNOWN"
+                logger.debug(f"Unhandled Copilot event (skipped): {ename}")
+
+    # ------------------------------------------------------------------
+    # Legacy shim kept for any existing call sites
+    # ------------------------------------------------------------------
+
+    def as_response_stream_event(
+        self, event: SessionEvent, context: AgentRunContext, item_id: str,
+    ) -> ResponseStreamEvent | None:
+        """Convert a single event.  Returns the first RAPI event produced, or None.
+
+        .. deprecated::
+            Prefer ``_convert_event`` (a generator) which may yield multiple events.
+        """
+        for e in self._convert_event(event, context, item_id):
+            return e
+        return None

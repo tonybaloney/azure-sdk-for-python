@@ -3,6 +3,7 @@
 # ---------------------------------------------------------
 # pylint: disable=logging-fstring-interpolation,broad-exception-caught
 import asyncio
+import dataclasses
 import os
 import uuid
 from typing import Any, Dict, List, Optional
@@ -214,10 +215,18 @@ async def _send_and_collect(session, prompt: str):
         last_key = key
 
         collected.append(event)
-        logger.debug(
-            f"Event: {event.type} data_type={type(event.data).__name__} "
-            f"text={text[:80]!r}"
-        )
+        if logger.isEnabledFor(10):  # DEBUG
+            data_fields: Dict[str, Any] = {}
+            if event.data is not None:
+                try:
+                    raw = dataclasses.asdict(event.data)
+                    data_fields = {k: v for k, v in raw.items() if v is not None}
+                except Exception:
+                    data_fields = {"repr": repr(event.data)}
+            logger.debug(
+                f"Event #{len(collected):03d} {event.type.name if event.type else '?'} "
+                f"data={data_fields}"
+            )
         if event.type == SessionEventType.SESSION_IDLE:
             done.set()
 
