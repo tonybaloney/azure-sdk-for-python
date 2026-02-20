@@ -106,6 +106,9 @@ class CopilotAdapter(FoundryCBAgent):
         # Map approval_request_id → {session_id, prompt, denied_requests}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
 
+        # Multi-turn: map conversation_id → live CopilotSession
+        self._sessions: Dict[str, Any] = {}
+
         # Keep credential for token refresh when using Foundry with Managed Identity
         if os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL") and not os.getenv("AZURE_AI_FOUNDRY_API_KEY"):
             from azure.identity import DefaultAzureCredential
@@ -153,15 +156,28 @@ class CopilotAdapter(FoundryCBAgent):
                 kind="denied-no-approval-rule-and-could-not-request-from-user"
             )
 
-        session_config = SessionConfig(**config, on_permission_request=_on_permission)
-        session = await client.create_session(session_config)
+        conversation_id = context.conversation_id
+        session = self._sessions.get(conversation_id) if conversation_id else None
+
+        if session is None:
+            logger.info(
+                f"Creating new Copilot session"
+                + (f" for conversation {conversation_id!r}" if conversation_id else "")
+            )
+            session_config = SessionConfig(**config, on_permission_request=_on_permission)
+            session = await client.create_session(session_config)
+            if conversation_id:
+                self._sessions[conversation_id] = session
+                logger.debug(f"Cached session {session.session_id!r} under conversation {conversation_id!r}")
+        else:
+            logger.info(f"Reusing Copilot session {session.session_id!r} for conversation turn (conversation={conversation_id!r})")
 
         try:
-            collected_events, _ = await _send_and_collect(session, prompt)
+            collected_events = await _send_and_collect(session, prompt)
 
-
-            # TODO: decide when to destroy session.
-            # await session.destroy()
+            # Session intentionally kept alive for multi-turn conversations.
+            # It will be evicted from _sessions when the client explicitly ends
+            # the conversation or the process restarts.
             if not context.stream:
                 # Non-streaming support is a dumb idea. IMO this should yield a not-supported-exception.
                 return CopilotResponseConverter.to_response("", context)
@@ -189,12 +205,15 @@ class CopilotAdapter(FoundryCBAgent):
         return "HostedAgent-Copilot"
 
 
-async def _send_and_collect(session, prompt: str):
+async def _send_and_collect(session, prompt: str) -> list:
     """Send a message and collect all events until SESSION_IDLE.
 
     The Copilot SDK emits every event twice after ``resume_session``.
     These duplicates are always **consecutive**, so we skip an event
     only when it is identical to the immediately preceding one.
+
+    The event listener is unsubscribed before returning so that reused
+    sessions (multi-turn) don't accumulate stale listeners.
     """
     collected = []
     last_key = None
@@ -230,8 +249,11 @@ async def _send_and_collect(session, prompt: str):
         if event.type == SessionEventType.SESSION_IDLE:
             done.set()
 
-    session.on(on_event)
-    await session.send(MessageOptions(prompt=prompt))
-    await asyncio.wait_for(done.wait(), timeout=120)
-    return collected, done
+    unsubscribe = session.on(on_event)
+    try:
+        await session.send(MessageOptions(prompt=prompt))
+        await asyncio.wait_for(done.wait(), timeout=120)
+    finally:
+        unsubscribe()
+    return collected
 
