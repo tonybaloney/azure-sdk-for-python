@@ -50,7 +50,7 @@ class CopilotResponseConverter:
         )
 
 
-class CopilotResponseStreamingConverter:
+class CopilotStreamingResponseConverter:
     """Converts Copilot SDK session events into OpenAI-format responses."""
 
     def __init__(self, context: AgentRunContext):
@@ -65,12 +65,13 @@ class CopilotResponseStreamingConverter:
         self._sequence += 1
         return self._sequence
 
-    def as_response_stream_event(self, event: SessionEvent, context: AgentRunContext) -> ResponseStreamEvent | None:
+    def as_response_stream_event(self, event: SessionEvent, context: AgentRunContext, item_id: str) -> ResponseStreamEvent | None:
         """Convert a single SessionEvent into a ResponseStreamEvent, if possible."""
         match event:
             case SessionEvent(type=SessionEventType.SESSION_START, data=data):
                 return ResponseCreatedEvent(
                     sequence_number=self.next_sequence(),
+                    item_id=item_id,
                     response=OpenAIResponse(
                         id=context.response_id, 
                         status="in_progress",
@@ -79,6 +80,7 @@ class CopilotResponseStreamingConverter:
             case SessionEvent(type=SessionEventType.SESSION_SHUTDOWN, data=data):
                 return ResponseCompletedEvent(
                     sequence_number=self.next_sequence(),
+                    item_id=item_id,
                     response=OpenAIResponse(
                         id=context.response_id, 
                         status="completed",
@@ -87,11 +89,13 @@ class CopilotResponseStreamingConverter:
             case SessionEvent(type=SessionEventType.ASSISTANT_MESSAGE_DELTA, data=data) if data and hasattr(data, "content"):
                 return ResponseTextDeltaEvent(
                     sequence_number=self.next_sequence(),
+                    item_id=item_id,
                     delta=data.content,
                 )
             case SessionEvent(type=SessionEventType.ASSISTANT_MESSAGE, data=data) if data and hasattr(data, "content"):
                 return ResponseTextDoneEvent(
                     sequence_number=self.next_sequence(),
+                    item_id=item_id,
                     text=data.content,
                 )
             
@@ -104,6 +108,6 @@ class CopilotResponseStreamingConverter:
         item_id = context.id_generator.generate_message_id()
 
         for event in events:
-            stream_event = self.as_response_stream_event(event, context)
+            stream_event = self.as_response_stream_event(event, context, item_id=item_id)
             if stream_event is not None:
                 yield stream_event
