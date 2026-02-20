@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
 from copilot.types import PermissionRequest, PermissionRequestResult, ResumeSessionConfig
-from opentelemetry import trace
+from opentelemetry import context as otel_context, trace
 
 from azure.ai.agentserver.core.constants import Constants
 from azure.ai.agentserver.core.logger import get_logger
@@ -187,45 +187,64 @@ class CopilotAdapter(FoundryCBAgent):
         if conversation_id:
             span_attrs["gen_ai.conversation.id"] = conversation_id
 
-        collected_events: list = []
-        try:
-            with tracer.start_as_current_span(
-                name=f"invoke_agent {agent_name}",
-                kind=trace.SpanKind.CLIENT,
-                attributes=span_attrs,
-            ) as span:
-                try:
-                    collected_events = await _send_and_collect(session, prompt)
-
-                    # Enrich span with usage from ASSISTANT_USAGE event
-                    for event in collected_events:
-                        if event.type == SessionEventType.ASSISTANT_USAGE and event.data:
-                            if event.data.model:
-                                span.set_attribute("gen_ai.response.model", event.data.model)
-                            if event.data.input_tokens is not None:
-                                span.set_attribute("gen_ai.usage.input_tokens", int(event.data.input_tokens))
-                            if event.data.output_tokens is not None:
-                                span.set_attribute("gen_ai.usage.output_tokens", int(event.data.output_tokens))
-                            break
-                    span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
-
-                except Exception as e:
-                    span.set_attribute("error.type", type(e).__name__)
-                    raise
-        except Exception as e:
-            logger.error(f"Error during Copilot agent run: {e}")
-            raise
-
-        # Session intentionally kept alive for multi-turn conversations.
-        # It will be evicted from _sessions when the client explicitly ends
-        # the conversation or the process restarts.
         if not context.stream:
-            # Non-streaming support is a dumb idea. IMO this should yield a not-supported-exception.
-            return CopilotResponseConverter.to_response("", context)
-        response_converter = CopilotStreamingResponseConverter(context)
-        return response_converter.to_stream_events(
-            collected_events, context,
+            # Non-streaming: collect all events to extract the final text.
+            text = ""
+            async for event in _iter_copilot_events(session, prompt):
+                if event.type == SessionEventType.ASSISTANT_MESSAGE and event.data and event.data.content:
+                    text = event.data.content
+            return CopilotResponseConverter.to_response(text, context)
+
+        # Streaming: return an async generator so events flow to the client
+        # immediately as the Copilot SDK emits them — no wait-until-idle.
+        return self._run_streaming(session, prompt, context, tracer, span_attrs)
+
+    async def _run_streaming(
+        self,
+        session: Any,
+        prompt: str,
+        context: AgentRunContext,
+        tracer: Any,
+        span_attrs: Dict[str, Any],
+    ):
+        """Async generator: converts Copilot events → RAPI stream events on-the-fly.
+
+        The OTel ``invoke_agent`` span is started before the first event and
+        closed in the ``finally`` block so its duration covers the full stream.
+        Usage attributes (token counts, response model) are set as soon as the
+        ``ASSISTANT_USAGE`` event arrives, before the span ends.
+        """
+        agent_name = span_attrs.get("gen_ai.agent.name", "")
+        span = tracer.start_span(
+            name=f"invoke_agent {agent_name}",
+            kind=trace.SpanKind.CLIENT,
+            attributes=span_attrs,
         )
+        token = otel_context.attach(trace.set_span_in_context(span))
+        try:
+            converter = CopilotStreamingResponseConverter(context)
+            item_id = context.id_generator.generate_message_id()
+            async for copilot_event in _iter_copilot_events(session, prompt):
+                # Enrich span from usage event (arrives after the assistant turn)
+                if copilot_event.type == SessionEventType.ASSISTANT_USAGE and copilot_event.data:
+                    data = copilot_event.data
+                    if data.model:
+                        span.set_attribute("gen_ai.response.model", data.model)
+                    if data.input_tokens is not None:
+                        span.set_attribute("gen_ai.usage.input_tokens", int(data.input_tokens))
+                    if data.output_tokens is not None:
+                        span.set_attribute("gen_ai.usage.output_tokens", int(data.output_tokens))
+                # Yield RAPI events immediately — 0..N per Copilot event
+                for rapi_event in converter._convert_event(copilot_event, context, item_id):
+                    yield rapi_event
+            span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
+        except Exception as e:
+            span.set_attribute("error.type", type(e).__name__)
+            logger.error(f"Error during Copilot streaming: {e}")
+            raise
+        finally:
+            otel_context.detach(token)
+            span.end()
 
     def get_trace_attributes(self):
         attrs = super().get_trace_attributes()
@@ -242,35 +261,36 @@ class CopilotAdapter(FoundryCBAgent):
         return "HostedAgent-Copilot"
 
 
-async def _send_and_collect(session, prompt: str) -> list:
-    """Send a message and collect all events until SESSION_IDLE.
+async def _iter_copilot_events(session, prompt: str, timeout: int = 120):
+    """Send *prompt* to *session* and yield each ``SessionEvent`` as it arrives.
 
-    The Copilot SDK emits every event twice after ``resume_session``.
-    These duplicates are always **consecutive**, so we skip an event
-    only when it is identical to the immediately preceding one.
+    This is a true async generator — it yields each event to the caller
+    immediately rather than waiting for ``SESSION_IDLE`` to collect them all.
+    The caller therefore begins processing (and forwarding to the HTTP client)
+    as soon as the first event arrives from the Copilot SDK.
 
-    The event listener is unsubscribed before returning so that reused
-    sessions (multi-turn) don't accumulate stale listeners.
+    Consecutive duplicate events (a ``resume_session``/reconnect artefact) are
+    silently dropped.  The generator stops after the ``SESSION_IDLE`` sentinel.
+    The event listener is unsubscribed in the ``finally`` block so reused
+    multi-turn sessions don't accumulate stale listeners.
     """
-    collected = []
+    queue: asyncio.Queue = asyncio.Queue()
     last_key = None
-    done = asyncio.Event()
+    event_count = 0
 
     def on_event(event):
-        nonlocal last_key
+        nonlocal last_key, event_count
         # Build a dedup key from type + content
         text = ""
         if event.data and hasattr(event.data, "content") and event.data.content:
             text = event.data.content
         key = (event.type, text)
-
-        # Skip only consecutive duplicates (resume_session replay artefact)
         if key == last_key:
             logger.debug(f"Skipping consecutive duplicate: {event.type}")
             return
         last_key = key
 
-        collected.append(event)
+        event_count += 1
         if logger.isEnabledFor(10):  # DEBUG
             data_fields: Dict[str, Any] = {}
             if event.data is not None:
@@ -280,17 +300,27 @@ async def _send_and_collect(session, prompt: str) -> list:
                 except Exception:
                     data_fields = {"repr": repr(event.data)}
             logger.debug(
-                f"Event #{len(collected):03d} {event.type.name if event.type else '?'} "
+                f"Event #{event_count:03d} {event.type.name if event.type else '?'} "
                 f"data={data_fields}"
             )
+
+        queue.put_nowait(event)
         if event.type == SessionEventType.SESSION_IDLE:
-            done.set()
+            queue.put_nowait(None)  # sentinel — closes the async for loop
 
     unsubscribe = session.on(on_event)
     try:
         await session.send(MessageOptions(prompt=prompt))
-        await asyncio.wait_for(done.wait(), timeout=120)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(f"Copilot session idle timeout after {timeout}s")
+            event = await asyncio.wait_for(queue.get(), timeout=remaining)
+            if event is None:  # sentinel
+                return
+            yield event
     finally:
         unsubscribe()
-    return collected
 
