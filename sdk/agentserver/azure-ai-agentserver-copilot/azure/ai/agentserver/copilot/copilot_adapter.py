@@ -22,7 +22,6 @@ from azure.ai.agentserver.core.server.common.agent_run_context import AgentRunCo
 from .models.copilot_request_converter import CopilotRequestConverter
 from .models.copilot_response_converter import CopilotResponseConverter, CopilotStreamingResponseConverter
 
-from azure.ai.agentserver.core.models import Response as _RespModel
 from azure.ai.agentserver.core.models.projects import (
     MCPApprovalRequestItemResource,
     ResponseIncompleteEvent,
@@ -260,16 +259,17 @@ class CopilotAdapter(FoundryCBAgent):
                             output_index=i,
                             item=approval_item,
                         )
+                    incomplete_output = [
+                        MCPApprovalRequestItemResource(
+                            id=d["request_id"],
+                            server_label="copilot-cli",
+                            name=d["permission_request"].get("kind", "unknown"),
+                            arguments=json.dumps({k: v for k, v in d["permission_request"].items() if k != "kind"}),
+                        ) for d in denied_requests
+                    ]
                     yield ResponseIncompleteEvent(
                         sequence_number=converter.next_sequence(),
-                        response=_RespModel(id=context.response_id, status="incomplete", output=[
-                            MCPApprovalRequestItemResource(
-                                id=d["request_id"],
-                                server_label="copilot-cli",
-                                name=d["permission_request"].get("kind", "unknown"),
-                                arguments=json.dumps({k: v for k, v in d["permission_request"].items() if k != "kind"}),
-                            ) for d in denied_requests
-                        ]),
+                        response=converter._build_response("incomplete", output=incomplete_output),
                     )
                     span.set_attribute("gen_ai.response.finish_reasons", ["tool_approval_required"])
                     return

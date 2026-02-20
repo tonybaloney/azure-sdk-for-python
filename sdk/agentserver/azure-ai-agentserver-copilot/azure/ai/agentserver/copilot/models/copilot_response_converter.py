@@ -3,6 +3,7 @@
 # ---------------------------------------------------------
 import datetime
 import json
+import time
 from typing import Any, Dict, Generator, List, Optional
 
 from copilot.generated.session_events import SessionEvent, SessionEventType
@@ -16,6 +17,7 @@ from azure.ai.agentserver.core.models.projects import (
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
     ResponseIncompleteEvent,
+    ResponseInProgressEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
     ResponsesAssistantMessageItemResource,
@@ -82,6 +84,8 @@ class CopilotStreamingResponseConverter:
         self.context = context
         # Sequence numbers start at -1; next_sequence() pre-increments before use.
         self._sequence = -1
+        # Capture creation timestamp once so all Response objects share it.
+        self._created_at: int = int(time.time())
         # Text accumulated from deltas so we can detect when ASSISTANT_MESSAGE
         # arrives without prior deltas and synthesise a single delta for it.
         self._accumulated_text: str = ""
@@ -92,6 +96,24 @@ class CopilotStreamingResponseConverter:
     def next_sequence(self) -> int:
         self._sequence += 1
         return self._sequence
+
+    def _build_response(self, status: str, output: Optional[list] = None) -> OpenAIResponse:
+        """Build a Response dict with all required fields, matching the langgraph/agentframework pattern."""
+        response_data: Dict[str, Any] = {
+            "object": "response",
+            "id": self.context.response_id,
+            "status": status,
+            "created_at": self._created_at,
+        }
+        agent_id = self.context.get_agent_id_object()
+        if agent_id is not None:
+            response_data["agent_id"] = agent_id
+        conversation = self.context.get_conversation_object()
+        if conversation is not None:
+            response_data["conversation"] = conversation
+        if output is not None:
+            response_data["output"] = output
+        return OpenAIResponse(response_data)
 
     # ------------------------------------------------------------------
     # Public API
@@ -121,7 +143,12 @@ class CopilotStreamingResponseConverter:
                 # response.created
                 yield ResponseCreatedEvent(
                     sequence_number=self.next_sequence(),
-                    response=OpenAIResponse(id=context.response_id, status="in_progress"),
+                    response=self._build_response("in_progress"),
+                )
+                # response.in_progress
+                yield ResponseInProgressEvent(
+                    sequence_number=self.next_sequence(),
+                    response=self._build_response("in_progress"),
                 )
                 # response.output_item.added  (empty assistant item, will be filled later)
                 yield ResponseOutputItemAddedEvent(
@@ -206,11 +233,7 @@ class CopilotStreamingResponseConverter:
                 output = [self._completed_item] if self._completed_item else []
                 yield ResponseCompletedEvent(
                     sequence_number=self.next_sequence(),
-                    response=OpenAIResponse(
-                        id=context.response_id,
-                        status="completed",
-                        output=output,
-                    ),
+                    response=self._build_response("completed", output=output),
                 )
 
             # ── Reasoning (extended thinking) ─────────────────────────────────
