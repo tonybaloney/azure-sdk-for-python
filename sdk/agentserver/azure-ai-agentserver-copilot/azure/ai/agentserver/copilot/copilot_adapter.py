@@ -4,6 +4,7 @@
 # pylint: disable=logging-fstring-interpolation,broad-exception-caught
 import asyncio
 import dataclasses
+import json
 import os
 import uuid
 from typing import Any, Dict, Optional
@@ -277,17 +278,39 @@ class CopilotAdapter(FoundryCBAgent):
                 data = copilot_event.data
 
                 # ── Tool execution start: open a child span ────────────────────
+                # Span follows OTel MCP semconv (tools/call):
+                # https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/
                 if copilot_event.type == SessionEventType.TOOL_EXECUTION_START and data:
                     call_id = data.tool_call_id or str(uuid.uuid4())
                     tool_name = data.mcp_tool_name or data.tool_name or "unknown"
+                    tool_attrs: Dict[str, Any] = {
+                        # Required by MCP semconv
+                        "mcp.method.name": "tools/call",
+                        # Conditionally required when tool is present
+                        "gen_ai.tool.name": tool_name,
+                        # Recommended
+                        "gen_ai.operation.name": "execute_tool",
+                        "network.transport": "pipe",  # Copilot SDK uses stdio
+                    }
+                    # mcp.session.id — recommended when part of a session
+                    try:
+                        tool_attrs["mcp.session.id"] = session.session_id
+                    except AttributeError:
+                        pass
+                    if call_id:
+                        tool_attrs["gen_ai.tool.call.id"] = call_id
+                    if data.mcp_server_name:
+                        tool_attrs["mcp.server.name"] = data.mcp_server_name
+                    # gen_ai.tool.call.arguments — opt-in per MCP semconv
+                    if data.arguments is not None:
+                        try:
+                            tool_attrs["gen_ai.tool.call.arguments"] = json.dumps(data.arguments)
+                        except Exception:
+                            tool_attrs["gen_ai.tool.call.arguments"] = str(data.arguments)
                     tool_span = tracer.start_span(
-                        name=f"execute_tool {tool_name}",
+                        name=f"tools/call {tool_name}",
                         kind=trace.SpanKind.CLIENT,
-                        attributes={
-                            "gen_ai.operation.name": "execute_tool",
-                            "gen_ai.tool.name": tool_name,
-                            "gen_ai.tool.call.id": call_id,
-                        },
+                        attributes=tool_attrs,
                     )
                     tool_token = otel_context.attach(trace.set_span_in_context(tool_span))
                     tool_spans[call_id] = (tool_span, tool_token)
@@ -299,9 +322,16 @@ class CopilotAdapter(FoundryCBAgent):
                     entry = tool_spans.pop(call_id, None) if call_id else None
                     if entry:
                         tool_span, tool_token = entry
+                        # gen_ai.tool.call.result — opt-in per MCP semconv
                         if data.result is not None:
-                            result_str = str(data.result)
-                            tool_span.set_attribute("gen_ai.tool.result", result_str[:512])
+                            try:
+                                result_str = json.dumps(data.result)
+                            except Exception:
+                                result_str = str(data.result)
+                            tool_span.set_attribute("gen_ai.tool.call.result", result_str[:512])
+                        # error.type — required when tool execution failed
+                        if hasattr(data, "success") and data.success is False:
+                            tool_span.set_attribute("error.type", "tool_error")
                         try:
                             otel_context.detach(tool_token)
                         except ValueError:
