@@ -18,7 +18,7 @@ from azure.ai.agentserver.core.logger import get_logger
 from azure.ai.agentserver.core.server.base import FoundryCBAgent
 from azure.ai.agentserver.core.server.common.agent_run_context import AgentRunContext
 
-from .models.copilot_request_converter import CopilotRequestConverter
+from .models.copilot_request_converter import ConvertedAttachments, CopilotRequestConverter
 from .models.copilot_response_converter import CopilotResponseConverter, CopilotStreamingResponseConverter
 from .tool_acl import ToolAcl
 
@@ -160,8 +160,12 @@ class CopilotAdapter(FoundryCBAgent):
 
     async def agent_run(self, context: AgentRunContext):
 
-        prompt = CopilotRequestConverter(context.request).convert()
+        req_converter = CopilotRequestConverter(context.request)
+        prompt = req_converter.convert()
         logger.debug(f"Copilot prompt: {prompt!r}")
+        converted_attachments = req_converter.convert_attachments()
+        if converted_attachments:
+            logger.debug(f"Attachments: {len(converted_attachments.attachments)} item(s)")
 
         client = await self._ensure_client()
         config = self._refresh_token_if_needed()
@@ -218,19 +222,23 @@ class CopilotAdapter(FoundryCBAgent):
         if not context.stream:
             # Non-streaming: collect all events to extract the final text.
             text = ""
-            async for event in _iter_copilot_events(session, prompt):
-                if event.type == SessionEventType.ASSISTANT_MESSAGE and event.data and event.data.content:
-                    text = event.data.content
+            try:
+                async for event in _iter_copilot_events(session, prompt, attachments=converted_attachments.attachments):
+                    if event.type == SessionEventType.ASSISTANT_MESSAGE and event.data and event.data.content:
+                        text = event.data.content
+            finally:
+                converted_attachments.cleanup()
             return CopilotResponseConverter.to_response(text, context)
 
         # Streaming: return an async generator so events flow to the client
         # immediately as the Copilot SDK emits them — no wait-until-idle.
-        return self._run_streaming(session, prompt, context, tracer, span_attrs)
+        return self._run_streaming(session, prompt, converted_attachments, context, tracer, span_attrs)
 
     async def _run_streaming(
         self,
         session: Any,
         prompt: str,
+        converted_attachments: ConvertedAttachments,
         context: AgentRunContext,
         tracer: Any,
         span_attrs: Dict[str, Any],
@@ -257,7 +265,7 @@ class CopilotAdapter(FoundryCBAgent):
         tool_spans: Dict[str, Any] = {}
         try:
             converter = CopilotStreamingResponseConverter(context)
-            async for copilot_event in _iter_copilot_events(session, prompt):
+            async for copilot_event in _iter_copilot_events(session, prompt, attachments=converted_attachments.attachments):
                 data = copilot_event.data
 
                 # ── Tool execution start: open a child span ────────────────────
@@ -324,6 +332,7 @@ class CopilotAdapter(FoundryCBAgent):
             except ValueError:
                 pass  # token created in a different async context — safe to ignore
             span.end()
+            converted_attachments.cleanup()
 
     def get_trace_attributes(self):
         attrs = super().get_trace_attributes()
@@ -340,7 +349,7 @@ class CopilotAdapter(FoundryCBAgent):
         return "HostedAgent-Copilot"
 
 
-async def _iter_copilot_events(session, prompt: str, timeout: int = 120):
+async def _iter_copilot_events(session, prompt: str, attachments: Optional[list] = None, timeout: int = 120):
     """Send *prompt* to *session* and yield each ``SessionEvent`` as it arrives.
 
     This is a true async generator — it yields each event to the caller
@@ -389,7 +398,10 @@ async def _iter_copilot_events(session, prompt: str, timeout: int = 120):
 
     unsubscribe = session.on(on_event)
     try:
-        await session.send(MessageOptions(prompt=prompt))
+        msg_opts: Dict[str, Any] = {"prompt": prompt}
+        if attachments:
+            msg_opts["attachments"] = attachments
+        await session.send(MessageOptions(**msg_opts))
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while True:
