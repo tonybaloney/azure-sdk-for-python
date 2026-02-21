@@ -59,7 +59,7 @@ import os
 from pathlib import Path
 import logging
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 from azure.ai.agentserver.copilot import from_copilot

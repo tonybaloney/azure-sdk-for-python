@@ -417,6 +417,12 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
         last_key = key
 
         event_count += 1
+        # INFO-level trace so deployed images can diagnose event flow without requiring DEBUG.
+        event_name = event.type.name if event.type else "UNKNOWN"
+        if text:
+            logger.info(f"Copilot event #{event_count:03d}: {event_name} content_len={len(text)}")
+        else:
+            logger.info(f"Copilot event #{event_count:03d}: {event_name}")
         if logger.isEnabledFor(10):  # DEBUG
             data_fields: Dict[str, Any] = {}
             if event.data is not None:
@@ -426,7 +432,7 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
                 except Exception:
                     data_fields = {"repr": repr(event.data)}
             logger.debug(
-                f"Event #{event_count:03d} {event.type.name if event.type else '?'} "
+                f"Event #{event_count:03d} {event_name} "
                 f"data={data_fields}"
             )
 
