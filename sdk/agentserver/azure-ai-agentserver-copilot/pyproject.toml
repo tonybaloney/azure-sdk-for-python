@@ -22,6 +22,7 @@ dependencies = [
     "azure-ai-agentserver-core",
     "azure-identity",
     "github-copilot-sdk>=0.1.25",
+    "PyYAML>=6.0",
 ]
 
 [build-system]

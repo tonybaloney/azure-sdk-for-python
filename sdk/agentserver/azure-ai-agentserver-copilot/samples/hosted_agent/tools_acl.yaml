@@ -1,0 +1,239 @@
+# =============================================================================
+# Tool Access Control List (ACL)  —  Copilot Hosted Agent Sample
+# =============================================================================
+#
+# Rules are evaluated **in order**.  The first rule whose ``kind`` and
+# optional ``when`` conditions all match is applied.  If no rule matches,
+# ``default_action`` is used.
+#
+# Schema
+# ------
+# version:        "1"   (required)
+# default_action: allow | deny   (optional, default "deny")
+# rules:
+#   - kind:    shell | read | write | url | mcp   # required
+#     action:  allow | deny                       # required
+#     when:                                        # optional; all sub-keys ANDed
+#       command: <regex>    # shell – matched against the full command text
+#       path:    <regex>    # read/write – matched against the file/dir path
+#       url:     <regex>    # url – matched against the full URL
+#       tool:    <regex>    # mcp – matched against the tool name
+#       server:  <regex>    # mcp – matched against the MCP server name
+#
+# Omit ``when`` to match every request of the given ``kind``.
+# All regex patterns are case-sensitive Python ``re.search`` patterns
+# (not anchored unless you add ``^`` / ``$``).
+#
+# =============================================================================
+
+version: "1"
+
+# If no rule matches, deny by default. Change to "allow" for a permissive
+# posture (useful during initial development / debugging).
+default_action: deny
+
+rules:
+
+  # ===========================================================================
+  # SHELL  (kind: shell)
+  #
+  # The Copilot agent uses a built-in shell tool to run system commands.
+  # ``when.command`` is matched against ``fullCommandText``, which contains
+  # the entire command string including arguments and redirections.
+  #
+  # Tip: use ``^`` to anchor patterns to the start of the command so that
+  # ``deny rm`` does not accidentally block ``git commit -m "remove ..."``
+  # ===========================================================================
+
+  # Always deny destructive or privileged commands — place early so that
+  # nothing below can accidentally allow them through a broad allow rule.
+  - kind: shell
+    action: deny
+    when:
+      command: "\\b(rm|rmdir|mkfs|dd|shred|wipefs|fdisk|parted|mkswap)\\b"
+
+  # Deny commands that make outbound network connections from the shell.
+  # The Copilot SDK has a dedicated ``url`` tool for web fetches; shell-level
+  # network access bypasses the URL ACL rules below.
+  - kind: shell
+    action: deny
+    when:
+      command: "^(curl|wget|nc|netcat|ncat|ssh|scp|sftp|ftp|rsync)\\b"
+
+  # Deny setuid / privilege escalation
+  - kind: shell
+    action: deny
+    when:
+      command: "^(sudo|su|doas|pkexec)\\b"
+
+  # Allow read-only inspection commands
+  - kind: shell
+    action: allow
+    when:
+      command: "^(echo|printf|cat|head|tail|less|more|wc|tee|tr|cut|sort|uniq|grep|awk|sed|diff|file|stat|du|df|find|ls|ll|la|dir)\\b"
+
+  # Allow Python / pip in version-check and list mode only
+  - kind: shell
+    action: allow
+    when:
+      command: "^python3?\\s+(-V|--version|-m pip list|\\s*-c\\s+[\"']?import\\s)"
+
+  # Allow version checks for common tools
+  - kind: shell
+    action: allow
+    when:
+      command: "^(git|node|npm|uv|pip3?|cargo|go|java|mvn)\\s+(--version|-v|-V|version)\\b"
+
+  # Allow git read-only operations (log, status, diff, show, blame, stash list)
+  - kind: shell
+    action: allow
+    when:
+      command: "^git\\s+(log|status|diff|show|blame|stash list|ls-files|describe|branch|tag|remote -v)\\b"
+
+  # Allow running unit tests — you may want to restrict this to your project dir
+  - kind: shell
+    action: allow
+    when:
+      command: "^(pytest|python3?\\s+-m pytest|uv run.*pytest)\\b"
+
+  # Allow safe environment inspection
+  - kind: shell
+    action: allow
+    when:
+      command: "^(env|printenv|set|export -p|whoami|id|pwd|hostname|uname|date|uptime)\\b"
+
+  # ===========================================================================
+  # READ  (kind: read)
+  #
+  # Triggered when the agent reads a file or lists a directory.
+  # ``when.path`` is matched against the absolute filesystem path.
+  # ===========================================================================
+
+  # Deny reading credentials and secrets no matter what rules follow
+  - kind: read
+    action: deny
+    when:
+      path: "(\\.ssh/|/etc/shadow|/etc/sudoers|\\.env$|\\.env\\.local$|/proc/\\d+/mem)"
+
+  # Deny common token / key files
+  - kind: read
+    action: deny
+    when:
+      path: "\\.(key|pem|p12|pfx|crt|cer|token|secret|credential)$"
+
+  # Allow reading anywhere under /tmp (scratch space used by the agent)
+  - kind: read
+    action: allow
+    when:
+      path: "^/tmp/"
+
+  # Allow reading the project source tree.
+  # Adjust this path to match your actual repository root.
+  - kind: read
+    action: allow
+    when:
+      path: "^/home/[^/]+/(projects?|repos?|src|workspace|code)/"
+
+  # Allow reading installed Python packages (needed for introspection)
+  - kind: read
+    action: allow
+    when:
+      path: "^/usr/lib/python|^/usr/local/lib/python|\\.venv/lib/python"
+
+  # Allow reading basic system information (non-secret)
+  - kind: read
+    action: allow
+    when:
+      path: "^/etc/(hostname|os-release|timezone|localtime|hosts$|resolv\\.conf$)"
+
+  # ===========================================================================
+  # WRITE  (kind: write)
+  #
+  # Triggered when the agent creates or modifies a file via the built-in
+  # write/edit tools.  ``when.path`` is matched against the destination path.
+  # ===========================================================================
+
+  # Allow writes only inside /tmp (scratch space)
+  - kind: write
+    action: allow
+    when:
+      path: "^/tmp/"
+
+  # Allow writes inside the project source tree.
+  # Adjust to your repository root.
+  - kind: write
+    action: allow
+    when:
+      path: "^/home/[^/]+/(projects?|repos?|src|workspace|code)/"
+
+  # Deny everything else (system paths, home directory root, etc.)
+  # This rule is implicit via default_action: deny — listed here for clarity.
+  - kind: write
+    action: deny
+
+  # ===========================================================================
+  # URL  (kind: url)
+  #
+  # Triggered when the agent fetches a URL via its built-in web tool.
+  # ``when.url`` is matched against the full URL string.
+  #
+  # Only HTTPS URLs should be permitted in production; HTTP is included here
+  # to allow ``http://example.com`` in the local development sample.
+  # ===========================================================================
+
+  # Deny known data-exfiltration / dynamic DNS services
+  - kind: url
+    action: deny
+    when:
+      url: "https?://(.*\\.)?(ngrok\\.io|serveo\\.net|localhost\\.run|requestbin\\.com|pipedream\\.net|webhook\\.site)"
+
+  # Allow Microsoft documentation and services
+  - kind: url
+    action: allow
+    when:
+      url: "^https://([a-z0-9-]+\\.)?microsoft\\.com/"
+
+  # Allow GitHub (docs, raw content, API, releases)
+  - kind: url
+    action: allow
+    when:
+      url: "^https://(([a-z0-9-]+\\.)?github\\.com|raw\\.githubusercontent\\.com|objects\\.githubusercontent\\.com)/"
+
+  # Allow Python documentation and package index
+  - kind: url
+    action: allow
+    when:
+      url: "^https://(docs\\.python\\.org|pypi\\.org|files\\.pythonhosted\\.org)/"
+
+  # Allow Azure documentation and APIs
+  - kind: url
+    action: allow
+    when:
+      url: "^https://([a-z0-9-]+\\.)?azure\\.com/"
+
+  # Allow the RFC-standard example domains used in documentation
+  - kind: url
+    action: allow
+    when:
+      url: "^https?://(www\\.)?example\\.(com|org|net)/"
+
+  # ===========================================================================
+  # MCP  (kind: mcp)
+  #
+  # Triggered when the agent calls a tool hosted on an MCP server.
+  # ``when.tool``   matches against the tool name.
+  # ``when.server`` matches against the MCP server name.
+  #
+  # Example: allow only the "read_file" and "search" tools from any server,
+  # but deny the "write_file" tool that could modify the workspace.
+  # ===========================================================================
+
+  # Deny write/delete operations on any MCP server
+  - kind: mcp
+    action: deny
+    when:
+      tool: "(write|create|delete|remove|update|patch|edit|modify)_"
+
+  # Allow everything else from registered MCP servers
+  - kind: mcp
+    action: allow

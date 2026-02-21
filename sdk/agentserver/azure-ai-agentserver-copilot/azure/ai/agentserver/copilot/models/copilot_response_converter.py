@@ -264,9 +264,41 @@ class CopilotStreamingResponseConverter:
 
             # ── Turn end ──────────────────────────────────────────────────────
             case SessionEvent(type=SessionEventType.ASSISTANT_TURN_END):
+                # Some models stream text entirely via ASSISTANT_MESSAGE_DELTA
+                # events without ever emitting a final ASSISTANT_MESSAGE.  In
+                # that case _completed_item is None but _accumulated_text holds
+                # the full text.  Synthesise the missing "done" events here so
+                # the client always gets a well-formed sequence.
+                if self._completed_item is None and self._accumulated_text:
+                    text = self._accumulated_text
+                    self._completed_item = ResponsesAssistantMessageItemResource(
+                        id=item_id,
+                        status="completed",
+                        content=[ItemContentOutputText(text=text, annotations=[])],
+                    )
+                    yield ResponseTextDoneEvent(
+                        sequence_number=self.next_sequence(),
+                        item_id=item_id,
+                        output_index=0,
+                        content_index=0,
+                        text=text,
+                    )
+                    yield ResponseContentPartDoneEvent(
+                        sequence_number=self.next_sequence(),
+                        item_id=item_id,
+                        output_index=0,
+                        content_index=0,
+                        part=ItemContentOutputText(text=text, annotations=[]),
+                    )
+                    yield ResponseOutputItemDoneEvent(
+                        sequence_number=self.next_sequence(),
+                        output_index=0,
+                        item=self._completed_item,
+                    )
+
                 if self._completed_item is not None:
-                    # Defer response.completed until ASSISTANT_USAGE arrives so token
-                    # counts can be embedded. SESSION_IDLE is the fallback trigger.
+                    # Defer response.completed until ASSISTANT_USAGE arrives so
+                    # token counts can be embedded.  SESSION_IDLE is the fallback.
                     self._pending_completed = True
                 else:
                     logger.debug("ASSISTANT_TURN_END with no text content (tool-calling turn) — skipping response.completed")

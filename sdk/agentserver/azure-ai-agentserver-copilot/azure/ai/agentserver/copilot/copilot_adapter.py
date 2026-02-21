@@ -20,6 +20,7 @@ from azure.ai.agentserver.core.server.common.agent_run_context import AgentRunCo
 
 from .models.copilot_request_converter import CopilotRequestConverter
 from .models.copilot_response_converter import CopilotResponseConverter, CopilotStreamingResponseConverter
+from .tool_acl import ToolAcl
 
 
 
@@ -107,11 +108,28 @@ class CopilotAdapter(FoundryCBAgent):
     :type session_config: Optional[SessionConfig]
     """
 
-    def __init__(self, session_config: Optional[SessionConfig] = None):
+    def __init__(
+        self,
+        session_config: Optional[SessionConfig] = None,
+        acl: Optional[ToolAcl] = None,
+    ):
         super().__init__()
         self._session_config = session_config or _build_session_config()
         self._client: Optional[CopilotClient] = None
         self._credential = None
+
+        # Tool ACL: explicit parameter takes priority over TOOL_ACL_PATH env var.
+        # If neither is set, every tool request is auto-approved (approve-all).
+        if acl is not None:
+            self._acl: Optional[ToolAcl] = acl
+        else:
+            self._acl = ToolAcl.from_env("TOOL_ACL_PATH")
+            if self._acl is None:
+                logger.warning(
+                    "No tool ACL configured (TOOL_ACL_PATH not set). "
+                    "All tool requests will be auto-approved. "
+                    "Set TOOL_ACL_PATH to a YAML ACL file for production use."
+                )
 
         # Multi-turn: map conversation_id → live CopilotSession
         self._sessions: Dict[str, Any] = {}
@@ -148,15 +166,24 @@ class CopilotAdapter(FoundryCBAgent):
         client = await self._ensure_client()
         config = self._refresh_token_if_needed()
 
+        acl = self._acl
+
         def _on_permission(req: PermissionRequest, _ctx: dict) -> PermissionRequestResult:
-            # TODO: Future approval flow — instead of auto-approving, the adapter
-            # should emit MCPApprovalRequestItemResource + ResponseIncompleteEvent
-            # and wait for the client to POST back an mcp_approval_response item
-            # before resuming the session.  For now, approve everything so the
-            # tool executes normally.
             kind = req.get("kind", "unknown")
-            logger.info(f"Auto-approving tool request: kind={kind}")
-            return PermissionRequestResult(kind="approved")
+            if acl is None:
+                # No ACL configured — approve everything (development / local mode).
+                logger.info(f"Auto-approving tool request (no ACL): kind={kind}")
+                return PermissionRequestResult(kind="approved")
+
+            if acl.is_allowed(req):
+                logger.info(f"ACL allowed tool request: kind={kind}")
+                return PermissionRequestResult(kind="approved")
+            else:
+                logger.warning(f"ACL denied tool request: kind={kind}")
+                return PermissionRequestResult(
+                    kind="denied-by-rules",
+                    rules=[],
+                )
 
         conversation_id = context.conversation_id
         session = self._sessions.get(conversation_id) if conversation_id else None

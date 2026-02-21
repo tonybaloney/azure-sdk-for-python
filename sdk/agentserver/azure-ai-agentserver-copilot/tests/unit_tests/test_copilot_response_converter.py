@@ -17,9 +17,13 @@ from copilot.generated.session_events import Data, SessionEvent, SessionEventTyp
 
 from azure.ai.agentserver.core.models.projects import (
     ResponseCompletedEvent,
+    ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
     ResponseInProgressEvent,
     ResponseOutputItemAddedEvent,
+    ResponseOutputItemDoneEvent,
+    ResponseTextDeltaEvent,
+    ResponseTextDoneEvent,
 )
 from azure.ai.agentserver.core.server.common.agent_run_context import AgentRunContext
 from azure.ai.agentserver.copilot.models.copilot_response_converter import CopilotStreamingResponseConverter
@@ -362,3 +366,101 @@ class TestUsage:
         assert len(completed) == 1
         # usage key should be absent / None
         assert completed[0].get("response").get("usage") is None
+
+
+# ---------------------------------------------------------------------------
+# Delta-only path (no ASSISTANT_MESSAGE event; text arrives via deltas only)
+# Regression test for: https://github.com/Azure/azure-sdk-for-python/issues/???
+# Some deployed models stream text entirely via ASSISTANT_MESSAGE_DELTA without
+# a final ASSISTANT_MESSAGE summary event.  The converter must synthesise the
+# missing "done" events and emit response.completed at ASSISTANT_TURN_END.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestDeltaOnlyStreaming:
+    """Verify correct event sequence when text arrives only via ASSISTANT_MESSAGE_DELTA."""
+
+    def _run_delta_only_turn(self, context: AgentRunContext, deltas: list[str]):
+        """Simulate a turn where text arrives only via deltas, with no ASSISTANT_MESSAGE."""
+        converter = CopilotStreamingResponseConverter(context)
+        events = []
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_START), context))
+        for delta in deltas:
+            events.extend(
+                converter._convert_event(
+                    _make_event(SessionEventType.ASSISTANT_MESSAGE_DELTA, delta),
+                    context,
+                )
+            )
+        # No ASSISTANT_MESSAGE — go straight to ASSISTANT_TURN_END
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context))
+        # Trigger response.completed via SESSION_IDLE fallback
+        events.extend(converter._convert_event(_make_event(SessionEventType.SESSION_IDLE), context))
+        return events, converter
+
+    def test_emits_output_text_done(self):
+        """response.output_text.done must be emitted even without ASSISTANT_MESSAGE."""
+        events, _ = self._run_delta_only_turn(_make_context(), ["Hello, ", "world!"])
+        done_events = [e for e in events if isinstance(e, ResponseTextDoneEvent)]
+        assert len(done_events) == 1
+
+    def test_output_text_done_contains_full_text(self):
+        """response.output_text.done text must be the concatenation of all deltas."""
+        events, _ = self._run_delta_only_turn(_make_context(), ["Hello, ", "world!"])
+        done = [e for e in events if isinstance(e, ResponseTextDoneEvent)][0]
+        assert done.get("text") == "Hello, world!"
+
+    def test_emits_content_part_done(self):
+        """response.content_part.done must be emitted."""
+        events, _ = self._run_delta_only_turn(_make_context(), ["Hi"])
+        assert any(isinstance(e, ResponseContentPartDoneEvent) for e in events)
+
+    def test_emits_output_item_done(self):
+        """response.output_item.done must be emitted."""
+        events, _ = self._run_delta_only_turn(_make_context(), ["Hi"])
+        assert any(isinstance(e, ResponseOutputItemDoneEvent) for e in events)
+
+    def test_emits_response_completed(self):
+        """response.completed must be emitted at the end of a delta-only turn."""
+        events, _ = self._run_delta_only_turn(_make_context(), ["Hi"])
+        completed = [e for e in events if isinstance(e, ResponseCompletedEvent)]
+        assert len(completed) == 1
+
+    def test_response_completed_contains_output_item(self):
+        """response.completed.response.output must contain the assembled message."""
+        events, _ = self._run_delta_only_turn(_make_context(), ["Hello, ", "world!"])
+        completed = [e for e in events if isinstance(e, ResponseCompletedEvent)][0]
+        output = completed.get("response").get("output")
+        assert output is not None and len(output) == 1
+        content = output[0].get("content", [])
+        assert any(c.get("text") == "Hello, world!" for c in content)
+
+    def test_delta_event_ordering(self):
+        """Deltas must precede done events in the stream."""
+        events, _ = self._run_delta_only_turn(_make_context(), ["A", "B"])
+        # Find positions of last delta and first done
+        positions = {
+            "last_delta": max(
+                (i for i, e in enumerate(events) if isinstance(e, ResponseTextDeltaEvent)),
+                default=-1,
+            ),
+            "first_done": next(
+                (i for i, e in enumerate(events) if isinstance(e, ResponseTextDoneEvent)),
+                9999,
+            ),
+        }
+        assert positions["last_delta"] < positions["first_done"], (
+            "All delta events must precede output_text.done"
+        )
+
+    def test_no_response_completed_when_no_text_at_all(self):
+        """A turn with neither deltas nor ASSISTANT_MESSAGE must NOT emit response.completed."""
+        context = _make_context()
+        converter = CopilotStreamingResponseConverter(context)
+        events = []
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_START), context))
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context))
+        events.extend(converter._convert_event(_make_event(SessionEventType.SESSION_IDLE), context))
+        completed = [e for e in events if isinstance(e, ResponseCompletedEvent)]
+        assert len(completed) == 0
