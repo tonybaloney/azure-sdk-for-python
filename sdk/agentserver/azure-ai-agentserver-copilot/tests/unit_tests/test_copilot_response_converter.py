@@ -454,8 +454,13 @@ class TestDeltaOnlyStreaming:
             "All delta events must precede output_text.done"
         )
 
-    def test_no_response_completed_when_no_text_at_all(self):
-        """A turn with neither deltas nor ASSISTANT_MESSAGE must NOT emit response.completed."""
+    def test_response_completed_emitted_when_no_text_at_all(self):
+        """A turn with no text must still emit exactly one response.completed at SESSION_IDLE.
+
+        The stream must always terminate with response.completed so the client
+        knows the response is done, even when the model produced no text
+        (e.g. a tool-only turn or an unusually empty response).
+        """
         context = _make_context()
         converter = CopilotStreamingResponseConverter(context)
         events = []
@@ -463,4 +468,10 @@ class TestDeltaOnlyStreaming:
         events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context))
         events.extend(converter._convert_event(_make_event(SessionEventType.SESSION_IDLE), context))
         completed = [e for e in events if isinstance(e, ResponseCompletedEvent)]
-        assert len(completed) == 0
+        # Exactly one response.completed must be emitted, with empty output.
+        assert len(completed) == 1
+        completed_event = completed[0]
+        response_dict = completed_event.as_dict()["response"]
+        assert response_dict.get("status") == "completed"
+        # output may be absent or empty — no items were produced
+        assert response_dict.get("output", []) == []
