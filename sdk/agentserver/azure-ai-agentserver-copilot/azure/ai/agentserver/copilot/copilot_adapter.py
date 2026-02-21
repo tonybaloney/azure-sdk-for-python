@@ -9,7 +9,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
-from copilot.generated.session_events import Data, SessionEvent, SessionEventType
+from copilot.generated.session_events import SessionEventType
 from copilot.types import PermissionRequest, PermissionRequestResult, ResumeSessionConfig
 from opentelemetry import context as otel_context, trace
 
@@ -221,13 +221,21 @@ class CopilotAdapter(FoundryCBAgent):
 
         if not context.stream:
             # Non-streaming: collect all events to extract the final text.
+            # Prefer the authoritative ASSISTANT_MESSAGE if one arrives; fall back
+            # to accumulating ASSISTANT_MESSAGE_DELTA events for models that never
+            # emit a final ASSISTANT_MESSAGE (delta-only models).
             text = ""
+            delta_parts: list[str] = []
             try:
                 async for event in _iter_copilot_events(session, prompt, attachments=converted_attachments.attachments):
                     if event.type == SessionEventType.ASSISTANT_MESSAGE and event.data and event.data.content:
-                        text = event.data.content
+                        text = event.data.content  # authoritative — use this if present
+                    elif event.type == SessionEventType.ASSISTANT_MESSAGE_DELTA and event.data and event.data.content:
+                        delta_parts.append(event.data.content)  # fallback accumulation
             finally:
                 converted_attachments.cleanup()
+            if not text and delta_parts:
+                text = "".join(delta_parts)
             return CopilotResponseConverter.to_response(text, context)
 
         # Streaming: return an async generator so events flow to the client
@@ -263,32 +271,9 @@ class CopilotAdapter(FoundryCBAgent):
         token = otel_context.attach(trace.set_span_in_context(span))
         # tool_call_id → (child_span, otel_token) for in-flight tool executions
         tool_spans: Dict[str, Any] = {}
-        # When FORCE_DELTA_ONLY=1, transform ASSISTANT_MESSAGE events into
-        # ASSISTANT_MESSAGE_DELTA events (without a final ASSISTANT_MESSAGE) to
-        # simulate models that stream text exclusively via deltas.  This
-        # exercises the ASSISTANT_TURN_END synthesis path in testing.
-        _force_delta_only = os.getenv("FORCE_DELTA_ONLY") == "1"
-
         try:
             converter = CopilotStreamingResponseConverter(context)
             async for copilot_event in _iter_copilot_events(session, prompt, attachments=converted_attachments.attachments):
-                if _force_delta_only and copilot_event.type == SessionEventType.ASSISTANT_MESSAGE:
-                    msg_content = copilot_event.data.content if copilot_event.data else None
-                    if msg_content:
-                        logger.info("FORCE_DELTA_ONLY: converting ASSISTANT_MESSAGE → ASSISTANT_MESSAGE_DELTA (no final message)")
-                        # Re-emit as a delta so _accumulated_text gets populated,
-                        # then drop the original so no _completed_item is set.
-                        fake_delta = SessionEvent(
-                            data=Data(content=msg_content),
-                            id=copilot_event.id,
-                            timestamp=copilot_event.timestamp,
-                            type=SessionEventType.ASSISTANT_MESSAGE_DELTA,
-                        )
-                        for rapi_event in converter._convert_event(fake_delta, context):
-                            yield rapi_event
-                    else:
-                        logger.info("FORCE_DELTA_ONLY: dropping empty ASSISTANT_MESSAGE")
-                    continue  # skip normal processing
                 data = copilot_event.data
 
                 # ── Tool execution start: open a child span ────────────────────
