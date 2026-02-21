@@ -4,10 +4,9 @@
 # pylint: disable=logging-fstring-interpolation,broad-exception-caught
 import asyncio
 import dataclasses
-import json
 import os
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
@@ -22,13 +21,16 @@ from azure.ai.agentserver.core.server.common.agent_run_context import AgentRunCo
 from .models.copilot_request_converter import CopilotRequestConverter
 from .models.copilot_response_converter import CopilotResponseConverter, CopilotStreamingResponseConverter
 
-from azure.ai.agentserver.core.models.projects import (
-    MCPApprovalRequestItemResource,
-    ResponseIncompleteEvent,
-    ResponseOutputItemAddedEvent as _ROIAddedEvent,
-)
+
 
 logger = get_logger()
+
+# The opentelemetry.context.detach() call can emit "Failed to detach context" warnings
+# when an async generator's finally block runs in a different contextvars context than
+# where the token was created.  This is expected behaviour in async streaming code and
+# does not affect tracing correctness (spans are still started and ended properly).
+import logging as _logging
+_logging.getLogger("opentelemetry.context").setLevel(_logging.CRITICAL)
 
 _COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
 
@@ -111,9 +113,6 @@ class CopilotAdapter(FoundryCBAgent):
         self._client: Optional[CopilotClient] = None
         self._credential = None
 
-        # Map approval_request_id → {session_id, prompt, denied_requests}
-        self._pending_approvals: Dict[str, Dict[str, Any]] = {}
-
         # Multi-turn: map conversation_id → live CopilotSession
         self._sessions: Dict[str, Any] = {}
 
@@ -149,20 +148,15 @@ class CopilotAdapter(FoundryCBAgent):
         client = await self._ensure_client()
         config = self._refresh_token_if_needed()
 
-        # First run: deny all tool requests and capture them
-        denied_requests: List[Dict[str, Any]] = []
-
         def _on_permission(req: PermissionRequest, _ctx: dict) -> PermissionRequestResult:
-            request_id = str(uuid.uuid4())
+            # TODO: Future approval flow — instead of auto-approving, the adapter
+            # should emit MCPApprovalRequestItemResource + ResponseIncompleteEvent
+            # and wait for the client to POST back an mcp_approval_response item
+            # before resuming the session.  For now, approve everything so the
+            # tool executes normally.
             kind = req.get("kind", "unknown")
-            logger.info(f"Denied tool (needs approval): kind={kind} id={request_id}")
-            denied_requests.append({
-                "request_id": request_id,
-                "permission_request": dict(req),
-            })
-            return PermissionRequestResult(
-                kind="denied-no-approval-rule-and-could-not-request-from-user"
-            )
+            logger.info(f"Auto-approving tool request: kind={kind}")
+            return PermissionRequestResult(kind="approved")
 
         conversation_id = context.conversation_id
         session = self._sessions.get(conversation_id) if conversation_id else None
@@ -204,7 +198,7 @@ class CopilotAdapter(FoundryCBAgent):
 
         # Streaming: return an async generator so events flow to the client
         # immediately as the Copilot SDK emits them — no wait-until-idle.
-        return self._run_streaming(session, prompt, context, tracer, span_attrs, denied_requests)
+        return self._run_streaming(session, prompt, context, tracer, span_attrs)
 
     async def _run_streaming(
         self,
@@ -213,7 +207,6 @@ class CopilotAdapter(FoundryCBAgent):
         context: AgentRunContext,
         tracer: Any,
         span_attrs: Dict[str, Any],
-        denied_requests: List[Dict[str, Any]],
     ):
         """Async generator: converts Copilot events → RAPI stream events on-the-fly.
 
@@ -221,6 +214,10 @@ class CopilotAdapter(FoundryCBAgent):
         closed in the ``finally`` block so its duration covers the full stream.
         Usage attributes (token counts, response model) are set as soon as the
         ``ASSISTANT_USAGE`` event arrives, before the span ends.
+
+        Per-tool ``execute_tool`` child spans are opened on
+        ``TOOL_EXECUTION_START`` and closed on ``TOOL_EXECUTION_COMPLETE``.
+        They inherit the trace context from the enclosing ``invoke_agent`` span.
         """
         agent_name = span_attrs.get("gen_ai.agent.name", "")
         span = tracer.start_span(
@@ -229,51 +226,57 @@ class CopilotAdapter(FoundryCBAgent):
             attributes=span_attrs,
         )
         token = otel_context.attach(trace.set_span_in_context(span))
+        # tool_call_id → (child_span, otel_token) for in-flight tool executions
+        tool_spans: Dict[str, Any] = {}
         try:
             converter = CopilotStreamingResponseConverter(context)
-            item_id = context.id_generator.generate_message_id()
             async for copilot_event in _iter_copilot_events(session, prompt):
-                # Enrich span from usage event (arrives after the assistant turn)
-                if copilot_event.type == SessionEventType.ASSISTANT_USAGE and copilot_event.data:
-                    data = copilot_event.data
+                data = copilot_event.data
+
+                # ── Tool execution start: open a child span ────────────────────
+                if copilot_event.type == SessionEventType.TOOL_EXECUTION_START and data:
+                    call_id = data.tool_call_id or str(uuid.uuid4())
+                    tool_name = data.mcp_tool_name or data.tool_name or "unknown"
+                    tool_span = tracer.start_span(
+                        name=f"execute_tool {tool_name}",
+                        kind=trace.SpanKind.CLIENT,
+                        attributes={
+                            "gen_ai.operation.name": "execute_tool",
+                            "gen_ai.tool.name": tool_name,
+                            "gen_ai.tool.call.id": call_id,
+                        },
+                    )
+                    tool_token = otel_context.attach(trace.set_span_in_context(tool_span))
+                    tool_spans[call_id] = (tool_span, tool_token)
+                    logger.debug(f"Tool span started: {tool_name!r} call_id={call_id!r}")
+
+                # ── Tool execution complete: close the matching child span ──────
+                elif copilot_event.type == SessionEventType.TOOL_EXECUTION_COMPLETE and data:
+                    call_id = data.tool_call_id
+                    entry = tool_spans.pop(call_id, None) if call_id else None
+                    if entry:
+                        tool_span, tool_token = entry
+                        if data.result is not None:
+                            result_str = str(data.result)
+                            tool_span.set_attribute("gen_ai.tool.result", result_str[:512])
+                        try:
+                            otel_context.detach(tool_token)
+                        except ValueError:
+                            pass  # token created in a different async context — safe to ignore
+                        tool_span.end()
+                        logger.debug(f"Tool span ended: call_id={call_id!r}")
+
+                # ── Enrich parent span from usage event ───────────────────────
+                elif copilot_event.type == SessionEventType.ASSISTANT_USAGE and data:
                     if data.model:
                         span.set_attribute("gen_ai.response.model", data.model)
                     if data.input_tokens is not None:
                         span.set_attribute("gen_ai.usage.input_tokens", int(data.input_tokens))
                     if data.output_tokens is not None:
                         span.set_attribute("gen_ai.usage.output_tokens", int(data.output_tokens))
+
                 # Yield RAPI events immediately — 0..N per Copilot event
-                # When the first ASSISTANT_TURN_END arrives and tools were denied,
-                # stop the normal flow and emit approval request + incomplete instead.
-                if copilot_event.type == SessionEventType.ASSISTANT_TURN_END and denied_requests:
-                    for i, denied in enumerate(denied_requests):
-                        req = denied["permission_request"]
-                        approval_item = MCPApprovalRequestItemResource(
-                            id=denied["request_id"],
-                            server_label="copilot-cli",
-                            name=req.get("kind", "unknown"),
-                            arguments=json.dumps({k: v for k, v in req.items() if k != "kind"}),
-                        )
-                        yield _ROIAddedEvent(
-                            sequence_number=converter.next_sequence(),
-                            output_index=i,
-                            item=approval_item,
-                        )
-                    incomplete_output = [
-                        MCPApprovalRequestItemResource(
-                            id=d["request_id"],
-                            server_label="copilot-cli",
-                            name=d["permission_request"].get("kind", "unknown"),
-                            arguments=json.dumps({k: v for k, v in d["permission_request"].items() if k != "kind"}),
-                        ) for d in denied_requests
-                    ]
-                    yield ResponseIncompleteEvent(
-                        sequence_number=converter.next_sequence(),
-                        response=converter._build_response("incomplete", output=incomplete_output),
-                    )
-                    span.set_attribute("gen_ai.response.finish_reasons", ["tool_approval_required"])
-                    return
-                for rapi_event in converter._convert_event(copilot_event, context, item_id):
+                for rapi_event in converter._convert_event(copilot_event, context):
                     yield rapi_event
             span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
         except Exception as e:
@@ -281,7 +284,18 @@ class CopilotAdapter(FoundryCBAgent):
             logger.error(f"Error during Copilot streaming: {e}")
             raise
         finally:
-            otel_context.detach(token)
+            # Close any tool spans that were never completed (e.g. stream aborted)
+            for call_id, (tool_span, tool_token) in list(tool_spans.items()):
+                tool_span.set_attribute("error.type", "stream_aborted")
+                try:
+                    otel_context.detach(tool_token)
+                except ValueError:
+                    pass  # token created in a different async context — safe to ignore
+                tool_span.end()
+            try:
+                otel_context.detach(token)
+            except ValueError:
+                pass  # token created in a different async context — safe to ignore
             span.end()
 
     def get_trace_attributes(self):
@@ -344,7 +358,7 @@ async def _iter_copilot_events(session, prompt: str, timeout: int = 120):
 
         queue.put_nowait(event)
         if event.type == SessionEventType.SESSION_IDLE:
-            queue.put_nowait(None)  # sentinel — closes the async for loop
+            queue.put_nowait(None)  # sentinel — closes the async for loop after SESSION_IDLE is processed
 
     unsubscribe = session.on(on_event)
     try:

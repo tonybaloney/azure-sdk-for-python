@@ -65,9 +65,12 @@ class CopilotStreamingResponseConverter:
 
     Copilot event                  RAPI events emitted
     ─────────────────────────────  ──────────────────────────────────────────────────────
-    ASSISTANT_TURN_START           response.created
+    ASSISTANT_TURN_START (1st)     response.created
+                                   response.in_progress
                                    response.output_item.added  (assistant message item)
                                    response.content_part.added (output_text part)
+    ASSISTANT_TURN_START (2nd+)    response.output_item.added  (new item, new item_id)
+                                   response.content_part.added
     ASSISTANT_MESSAGE_DELTA        response.output_text.delta
                                    (may not fire for all models; content may arrive in
                                     one shot via ASSISTANT_MESSAGE instead)
@@ -75,7 +78,9 @@ class CopilotStreamingResponseConverter:
                                    response.output_text.done
                                    response.content_part.done
                                    response.output_item.done
-    ASSISTANT_TURN_END             response.completed
+    ASSISTANT_TURN_END             response.completed  (only if there is text content;
+                                   tool-calling turns with no text are silently skipped)
+    ASSISTANT_USAGE                (stored internally; included in response.completed)
     ASSISTANT_REASONING            (logged only; no RAPI event — not in spec yet)
     everything else                (ignored)
     """
@@ -92,12 +97,28 @@ class CopilotStreamingResponseConverter:
         # The completed assistant message item built during ASSISTANT_MESSAGE;
         # stored so ASSISTANT_TURN_END can embed it in ResponseCompletedEvent.
         self._completed_item: Optional[ResponsesAssistantMessageItemResource] = None
+        # Turn counter: tracks how many ASSISTANT_TURN_START events have been seen.
+        # Only the first turn gets response.created / response.in_progress.
+        self._turn_count: int = 0
+        # Per-turn item ID — regenerated at each ASSISTANT_TURN_START so that
+        # the second (actual-answer) turn in a tool-using exchange gets a unique ID.
+        self._item_id: str = context.id_generator.generate_message_id()
+        # Token usage received from ASSISTANT_USAGE; included in response.completed.
+        self._usage: Optional[Dict[str, Any]] = None
+        # Pending response.completed awaiting ASSISTANT_USAGE (set True on ASSISTANT_TURN_END
+        # when there is text content; emitted when ASSISTANT_USAGE or SESSION_IDLE arrives).
+        self._pending_completed: bool = False
 
     def next_sequence(self) -> int:
         self._sequence += 1
         return self._sequence
 
-    def _build_response(self, status: str, output: Optional[list] = None) -> OpenAIResponse:
+    def _build_response(
+        self,
+        status: str,
+        output: Optional[list] = None,
+        usage: Optional[Dict[str, Any]] = None,
+    ) -> OpenAIResponse:
         """Build a Response dict with all required fields, matching the langgraph/agentframework pattern."""
         response_data: Dict[str, Any] = {
             "object": "response",
@@ -113,6 +134,8 @@ class CopilotStreamingResponseConverter:
             response_data["conversation"] = conversation
         if output is not None:
             response_data["output"] = output
+        if usage is not None:
+            response_data["usage"] = usage
         return OpenAIResponse(response_data)
 
     # ------------------------------------------------------------------
@@ -123,33 +146,44 @@ class CopilotStreamingResponseConverter:
         self, events: list[SessionEvent], context: AgentRunContext,
     ) -> Generator[ResponseStreamEvent, None, None]:
         """Convert a collected batch of Copilot SessionEvents into RAPI stream events."""
-        item_id = context.id_generator.generate_message_id()
         for event in events:
-            yield from self._convert_event(event, context, item_id)
+            yield from self._convert_event(event, context)
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
     def _convert_event(
-        self, event: SessionEvent, context: AgentRunContext, item_id: str,
+        self, event: SessionEvent, context: AgentRunContext,
     ) -> Generator[ResponseStreamEvent, None, None]:
         """Yield zero or more RAPI ResponseStreamEvents for a single Copilot session event."""
+        item_id = self._item_id
 
         match event:
 
             # ── Turn start ────────────────────────────────────────────────────
             case SessionEvent(type=SessionEventType.ASSISTANT_TURN_START):
-                # response.created
-                yield ResponseCreatedEvent(
-                    sequence_number=self.next_sequence(),
-                    response=self._build_response("in_progress"),
-                )
-                # response.in_progress
-                yield ResponseInProgressEvent(
-                    sequence_number=self.next_sequence(),
-                    response=self._build_response("in_progress"),
-                )
+                # Generate a fresh item ID for this turn so the second turn in a
+                # tool-using exchange doesn't reuse the first turn's item ID.
+                self._item_id = context.id_generator.generate_message_id()
+                item_id = self._item_id
+                # Reset per-turn state so the second turn starts clean.
+                self._accumulated_text = ""
+                self._completed_item = None
+                is_first_turn = self._turn_count == 0
+                self._turn_count += 1
+
+                if is_first_turn:
+                    # response.created — only on initial turn
+                    yield ResponseCreatedEvent(
+                        sequence_number=self.next_sequence(),
+                        response=self._build_response("in_progress"),
+                    )
+                    # response.in_progress — only on initial turn
+                    yield ResponseInProgressEvent(
+                        sequence_number=self.next_sequence(),
+                        response=self._build_response("in_progress"),
+                    )
                 # response.output_item.added  (empty assistant item, will be filled later)
                 yield ResponseOutputItemAddedEvent(
                     sequence_number=self.next_sequence(),
@@ -230,11 +264,53 @@ class CopilotStreamingResponseConverter:
 
             # ── Turn end ──────────────────────────────────────────────────────
             case SessionEvent(type=SessionEventType.ASSISTANT_TURN_END):
-                output = [self._completed_item] if self._completed_item else []
-                yield ResponseCompletedEvent(
-                    sequence_number=self.next_sequence(),
-                    response=self._build_response("completed", output=output),
-                )
+                if self._completed_item is not None:
+                    # Defer response.completed until ASSISTANT_USAGE arrives so token
+                    # counts can be embedded. SESSION_IDLE is the fallback trigger.
+                    self._pending_completed = True
+                else:
+                    logger.debug("ASSISTANT_TURN_END with no text content (tool-calling turn) — skipping response.completed")
+
+            # ── Token / model usage ───────────────────────────────────────────
+            case SessionEvent(type=SessionEventType.ASSISTANT_USAGE, data=data) if data:
+                # Store usage so it can be embedded in the final response.completed.
+                usage: Dict[str, Any] = {}
+                if data.input_tokens is not None:
+                    usage["input_tokens"] = int(data.input_tokens)
+                if data.output_tokens is not None:
+                    usage["output_tokens"] = int(data.output_tokens)
+                total = (int(data.input_tokens) if data.input_tokens is not None else 0) + \
+                        (int(data.output_tokens) if data.output_tokens is not None else 0)
+                if total:
+                    usage["total_tokens"] = total
+                if usage:
+                    self._usage = usage
+                    logger.debug(f"Usage recorded: {usage}")
+                # Emit response.completed if ASSISTANT_TURN_END was already seen.
+                if self._pending_completed and self._completed_item is not None:
+                    self._pending_completed = False
+                    yield ResponseCompletedEvent(
+                        sequence_number=self.next_sequence(),
+                        response=self._build_response(
+                            "completed",
+                            output=[self._completed_item],
+                            usage=self._usage,
+                        ),
+                    )
+
+            # ── Session idle: emit any deferred response.completed ─────────────
+            case SessionEvent(type=SessionEventType.SESSION_IDLE):
+                # Fallback: ASSISTANT_USAGE did not arrive before SESSION_IDLE.
+                if self._pending_completed and self._completed_item is not None:
+                    self._pending_completed = False
+                    yield ResponseCompletedEvent(
+                        sequence_number=self.next_sequence(),
+                        response=self._build_response(
+                            "completed",
+                            output=[self._completed_item],
+                            usage=self._usage,
+                        ),
+                    )
 
             # ── Reasoning (extended thinking) ─────────────────────────────────
             case SessionEvent(type=SessionEventType.ASSISTANT_REASONING, data=data):
@@ -252,13 +328,13 @@ class CopilotStreamingResponseConverter:
     # ------------------------------------------------------------------
 
     def as_response_stream_event(
-        self, event: SessionEvent, context: AgentRunContext, item_id: str,
+        self, event: SessionEvent, context: AgentRunContext,
     ) -> ResponseStreamEvent | None:
         """Convert a single event.  Returns the first RAPI event produced, or None.
 
         .. deprecated::
             Prefer ``_convert_event`` (a generator) which may yield multiple events.
         """
-        for e in self._convert_event(event, context, item_id):
+        for e in self._convert_event(event, context):
             return e
         return None

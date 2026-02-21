@@ -19,6 +19,7 @@ from azure.ai.agentserver.core.models.projects import (
     ResponseCompletedEvent,
     ResponseCreatedEvent,
     ResponseInProgressEvent,
+    ResponseOutputItemAddedEvent,
 )
 from azure.ai.agentserver.core.server.common.agent_run_context import AgentRunContext
 from azure.ai.agentserver.copilot.models.copilot_response_converter import CopilotStreamingResponseConverter
@@ -29,9 +30,9 @@ from azure.ai.agentserver.copilot.models.copilot_response_converter import Copil
 # ---------------------------------------------------------------------------
 
 
-def _make_event(event_type: SessionEventType, content: str | None = None) -> SessionEvent:
+def _make_event(event_type: SessionEventType, content: str | None = None, **kwargs) -> SessionEvent:
     """Create a real SessionEvent dataclass instance (MagicMock won't match dataclass patterns)."""
-    data = Data(content=content)
+    data = Data(content=content, **kwargs)
     return SessionEvent(
         data=data,
         id=uuid.uuid4(),
@@ -49,16 +50,29 @@ def _make_context(*, with_agent: bool = True, with_conversation: bool = True) ->
     return AgentRunContext(payload)
 
 
-def _events_for_turn(context: AgentRunContext, *, include_message: bool = True):
-    """Run ASSISTANT_TURN_START (and optionally a message + turn end) through the converter."""
+def _events_for_turn(context: AgentRunContext, *, include_message: bool = True, trigger: str = "idle"):
+    """Run ASSISTANT_TURN_START (and optionally a message + turn end) through the converter.
+
+    ``trigger`` controls how response.completed is fired after ASSISTANT_TURN_END:
+    - ``"usage"``  — send ASSISTANT_USAGE (with dummy token counts)
+    - ``"idle"``   — send SESSION_IDLE  (default; simulates no usage event)
+    """
     converter = CopilotStreamingResponseConverter(context)
-    item_id = context.id_generator.generate_message_id()
     events = []
-    events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_START), context, item_id))
+    events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_START), context))
     if include_message:
         text_event = _make_event(SessionEventType.ASSISTANT_MESSAGE, "Hello!")
-        events.extend(converter._convert_event(text_event, context, item_id))
-        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context, item_id))
+        events.extend(converter._convert_event(text_event, context))
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context))
+        if trigger == "usage":
+            events.extend(
+                converter._convert_event(
+                    _make_event(SessionEventType.ASSISTANT_USAGE, input_tokens=10, output_tokens=5),
+                    context,
+                )
+            )
+        else:  # "idle"
+            events.extend(converter._convert_event(_make_event(SessionEventType.SESSION_IDLE), context))
     return events, converter
 
 
@@ -218,3 +232,133 @@ class TestTurnEndEvents:
         created_at_start = events[0].get("response").get("created_at")
         created_at_end = events[-1].get("response").get("created_at")
         assert created_at_start == created_at_end
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn (tool-using) behaviour
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestMultiTurn:
+    """Verify correct event emission across two ASSISTANT_TURN_START cycles."""
+
+    def _run_two_turns(self, context: AgentRunContext):
+        """Simulate: turn1 (no text), tool, turn2 (with text).
+
+        Returns the full list of events from both turns.
+        """
+        converter = CopilotStreamingResponseConverter(context)
+        events = []
+        # Turn 1: tool-calling turn — no text content
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_START), context))
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context))
+        # Turn 2: actual answer turn
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_START), context))
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_MESSAGE, "Done!"), context))
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context))
+        # ASSISTANT_USAGE arrives after ASSISTANT_TURN_END — triggers response.completed
+        events.extend(
+            converter._convert_event(
+                _make_event(SessionEventType.ASSISTANT_USAGE, input_tokens=10, output_tokens=5),
+                context,
+            )
+        )
+        return events, converter
+
+    def test_response_created_emitted_only_once(self):
+        """response.created must appear exactly once across a two-turn tool exchange."""
+        events, _ = self._run_two_turns(_make_context())
+        created = [e for e in events if isinstance(e, ResponseCreatedEvent)]
+        assert len(created) == 1
+
+    def test_response_in_progress_emitted_only_once(self):
+        """response.in_progress must appear exactly once across a two-turn tool exchange."""
+        events, _ = self._run_two_turns(_make_context())
+        in_prog = [e for e in events if isinstance(e, ResponseInProgressEvent)]
+        assert len(in_prog) == 1
+
+    def test_second_turn_gets_different_item_id(self):
+        """The output_item.added events for turn 1 and turn 2 must use different item IDs."""
+        events, _ = self._run_two_turns(_make_context())
+        added = [e for e in events if isinstance(e, ResponseOutputItemAddedEvent)]
+        assert len(added) == 2
+        id1 = added[0].get("item", {}).get("id")
+        id2 = added[1].get("item", {}).get("id")
+        assert id1 is not None
+        assert id2 is not None
+        assert id1 != id2
+
+    def test_no_response_completed_on_first_turn_when_no_content(self):
+        """Tool-calling turns (no text output) must NOT emit response.completed."""
+        context = _make_context()
+        converter = CopilotStreamingResponseConverter(context)
+        events = []
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_START), context))
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context))
+        completed = [e for e in events if isinstance(e, ResponseCompletedEvent)]
+        assert len(completed) == 0
+
+    def test_response_completed_emitted_once_at_end(self):
+        """response.completed must appear exactly once — only for the final content turn."""
+        events, _ = self._run_two_turns(_make_context())
+        completed = [e for e in events if isinstance(e, ResponseCompletedEvent)]
+        assert len(completed) == 1
+
+
+# ---------------------------------------------------------------------------
+# Token usage from ASSISTANT_USAGE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestUsage:
+    """Verify ASSISTANT_USAGE is captured and embedded in response.completed."""
+
+    def _run_turn_with_usage(self, context: AgentRunContext, input_tokens: int, output_tokens: int):
+        converter = CopilotStreamingResponseConverter(context)
+        events = []
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_START), context))
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_MESSAGE, "Hi"), context))
+        # Real SDK order: ASSISTANT_TURN_END comes before ASSISTANT_USAGE
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context))
+        usage_event = _make_event(
+            SessionEventType.ASSISTANT_USAGE,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        events.extend(converter._convert_event(usage_event, context))
+        return events, converter
+
+    def test_usage_stored_after_assistant_usage_event(self):
+        """After ASSISTANT_USAGE, converter._usage is populated."""
+        context = _make_context()
+        _, converter = self._run_turn_with_usage(context, input_tokens=10, output_tokens=5)
+        assert converter._usage is not None
+        assert converter._usage.get("input_tokens") == 10
+        assert converter._usage.get("output_tokens") == 5
+
+    def test_usage_total_tokens_computed(self):
+        """total_tokens is the sum of input + output."""
+        context = _make_context()
+        _, converter = self._run_turn_with_usage(context, input_tokens=10, output_tokens=5)
+        assert converter._usage.get("total_tokens") == 15
+
+    def test_usage_included_in_response_completed(self):
+        """response.completed.response must contain usage when ASSISTANT_USAGE was received."""
+        context = _make_context()
+        events, _ = self._run_turn_with_usage(context, input_tokens=10, output_tokens=5)
+        completed = [e for e in events if isinstance(e, ResponseCompletedEvent)]
+        assert len(completed) == 1
+        usage = completed[0].get("response").get("usage")
+        assert usage is not None
+        assert usage.get("input_tokens") == 10
+        assert usage.get("output_tokens") == 5
+
+    def test_no_usage_when_assistant_usage_not_received(self):
+        """If no ASSISTANT_USAGE event arrives, response.completed has no usage field."""
+        events, _ = _events_for_turn(_make_context())
+        completed = [e for e in events if isinstance(e, ResponseCompletedEvent)]
+        assert len(completed) == 1
+        # usage key should be absent / None
+        assert completed[0].get("response").get("usage") is None
