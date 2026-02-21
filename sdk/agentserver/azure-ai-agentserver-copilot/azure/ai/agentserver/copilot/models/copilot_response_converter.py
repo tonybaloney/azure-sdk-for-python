@@ -2,22 +2,18 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # ---------------------------------------------------------
 import datetime
-import json
 import time
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, Optional
 
 from copilot.generated.session_events import SessionEvent, SessionEventType
 
 from azure.ai.agentserver.core.models import Response as OpenAIResponse
 from azure.ai.agentserver.core.models.projects import (
     ItemContentOutputText,
-    MCPApprovalRequestItemResource,
-    ReasoningItemResource,
     ResponseCompletedEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
-    ResponseIncompleteEvent,
     ResponseInProgressEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
@@ -60,61 +56,33 @@ class CopilotResponseConverter:
 
 
 class CopilotStreamingResponseConverter:
-    """Converts Copilot SDK session events into OpenAI-format streaming response events.
+    """Converts Copilot SDK session events into RAPI streaming response events.
 
-    Event mapping (based on observed GitHub Copilot SDK event flow):
+    The runtime emits events in a strict, guaranteed order per turn:
 
-    Copilot event                  RAPI events emitted
-    ─────────────────────────────  ──────────────────────────────────────────────────────
-    ASSISTANT_TURN_START (1st)     response.created
-                                   response.in_progress
-                                   response.output_item.added  (assistant message item)
-                                   response.content_part.added (output_text part)
-    ASSISTANT_TURN_START (2nd+)    response.output_item.added  (new item, new item_id)
-                                   response.content_part.added
-    ASSISTANT_MESSAGE_DELTA        response.output_text.delta
-                                   (may not fire for all models; content may arrive in
-                                    one shot via ASSISTANT_MESSAGE instead)
-    ASSISTANT_MESSAGE              response.output_text.delta  (if no prior deltas)
-                                   response.output_text.done
-                                   response.content_part.done
-                                   response.output_item.done
-    ASSISTANT_TURN_END             response.completed  (only if there is text content;
-                                   tool-calling turns with no text are silently skipped)
-    ASSISTANT_USAGE                (stored internally; included in response.completed)
-    ASSISTANT_REASONING            (logged only; no RAPI event — not in spec yet)
-    everything else                (ignored)
+        ASSISTANT_TURN_START
+        ASSISTANT_MESSAGE_DELTA ×N   (streaming text chunks)
+        ASSISTANT_USAGE              (token counts — arrives BEFORE message)
+        ASSISTANT_MESSAGE            (authoritative full text — always emitted)
+        ASSISTANT_TURN_END           (always emitted, even on error)
+        SESSION_IDLE                 (session finished processing)
+
+    In multi-turn (tool-calling) flows the turn sequence repeats.  Only the
+    final turn that produces text content gets ``response.completed``.
+
+    The converter is intentionally simple: each Copilot event maps to a fixed
+    set of RAPI events with no deferred state or pending flags.
     """
 
     def __init__(self, context: AgentRunContext):
         self.context = context
-        # Sequence numbers start at -1; next_sequence() pre-increments before use.
         self._sequence = -1
-        # Capture creation timestamp once so all Response objects share it.
         self._created_at: int = int(time.time())
-        # Text accumulated from deltas so we can detect when ASSISTANT_MESSAGE
-        # arrives without prior deltas and synthesise a single delta for it.
         self._accumulated_text: str = ""
-        # The completed assistant message item built during ASSISTANT_MESSAGE;
-        # stored so ASSISTANT_TURN_END can embed it in ResponseCompletedEvent.
-        self._completed_item: Optional[ResponsesAssistantMessageItemResource] = None
-        # Turn counter: tracks how many ASSISTANT_TURN_START events have been seen.
-        # Only the first turn gets response.created / response.in_progress.
         self._turn_count: int = 0
-        # Per-turn item ID — regenerated at each ASSISTANT_TURN_START so that
-        # the second (actual-answer) turn in a tool-using exchange gets a unique ID.
         self._item_id: str = context.id_generator.generate_message_id()
-        # Token usage received from ASSISTANT_USAGE; included in response.completed.
         self._usage: Optional[Dict[str, Any]] = None
-        # Pending response.completed awaiting ASSISTANT_USAGE (set True on ASSISTANT_TURN_END
-        # when there is text content; emitted when ASSISTANT_USAGE or SESSION_IDLE arrives).
-        self._pending_completed: bool = False
-        # Set to True once response.completed has been yielded so SESSION_IDLE
-        # cannot double-emit it after ASSISTANT_USAGE already sent it.
-        self._response_completed: bool = False
-        # Running index of output items emitted — incremented when a reasoning
-        # item is added so the message item lands at the correct output_index.
-        self._output_index: int = 0
+        self._completed: bool = False
 
     def next_sequence(self) -> int:
         self._sequence += 1
@@ -170,43 +138,34 @@ class CopilotStreamingResponseConverter:
 
             # ── Turn start ────────────────────────────────────────────────────
             case SessionEvent(type=SessionEventType.ASSISTANT_TURN_START):
-                # Generate a fresh item ID for this turn so the second turn in a
-                # tool-using exchange doesn't reuse the first turn's item ID.
                 self._item_id = context.id_generator.generate_message_id()
                 item_id = self._item_id
-                # Reset per-turn state so the second turn starts clean.
                 self._accumulated_text = ""
-                self._completed_item = None
-                self._output_index = 0  # reset; ASSISTANT_REASONING will bump this
                 is_first_turn = self._turn_count == 0
                 self._turn_count += 1
 
                 if is_first_turn:
-                    # response.created — only on initial turn
                     yield ResponseCreatedEvent(
                         sequence_number=self.next_sequence(),
                         response=self._build_response("in_progress"),
                     )
-                    # response.in_progress — only on initial turn
                     yield ResponseInProgressEvent(
                         sequence_number=self.next_sequence(),
                         response=self._build_response("in_progress"),
                     )
-                # response.output_item.added  (empty assistant item, will be filled later)
                 yield ResponseOutputItemAddedEvent(
                     sequence_number=self.next_sequence(),
-                    output_index=self._output_index,
+                    output_index=0,
                     item=ResponsesAssistantMessageItemResource(
                         id=item_id,
                         status="in_progress",
                         content=[],
                     ),
                 )
-                # response.content_part.added  (empty text part)
                 yield ResponseContentPartAddedEvent(
                     sequence_number=self.next_sequence(),
                     item_id=item_id,
-                    output_index=self._output_index,
+                    output_index=0,
                     content_index=0,
                     part=ItemContentOutputText(text="", annotations=[]),
                 )
@@ -217,107 +176,13 @@ class CopilotStreamingResponseConverter:
                 yield ResponseTextDeltaEvent(
                     sequence_number=self.next_sequence(),
                     item_id=item_id,
-                    output_index=self._output_index,
+                    output_index=0,
                     content_index=0,
                     delta=data.content,
                 )
 
-            # ── Full assistant message ────────────────────────────────────────
-            case SessionEvent(type=SessionEventType.ASSISTANT_MESSAGE, data=data) if data and data.content:
-                text = data.content
-
-                # If no deltas arrived (e.g. Claude returns all at once), emit
-                # a synthetic delta now so clients get at least one delta event.
-                if not self._accumulated_text:
-                    self._accumulated_text = text
-                    yield ResponseTextDeltaEvent(
-                        sequence_number=self.next_sequence(),
-                        item_id=item_id,
-                        output_index=0,
-                        content_index=0,
-                        delta=text,
-                    )
-
-                # response.output_text.done
-                yield ResponseTextDoneEvent(
-                    sequence_number=self.next_sequence(),
-                    item_id=item_id,
-                    output_index=self._output_index,
-                    content_index=0,
-                    text=text,
-                )
-
-                # Build the completed item now so ASSISTANT_TURN_END can embed it.
-                self._completed_item = ResponsesAssistantMessageItemResource(
-                    id=item_id,
-                    status="completed",
-                    content=[ItemContentOutputText(text=text, annotations=[])],
-                )
-
-                # response.content_part.done
-                yield ResponseContentPartDoneEvent(
-                    sequence_number=self.next_sequence(),
-                    item_id=item_id,
-                    output_index=self._output_index,
-                    content_index=0,
-                    part=ItemContentOutputText(text=text, annotations=[]),
-                )
-
-                # response.output_item.done
-                yield ResponseOutputItemDoneEvent(
-                    sequence_number=self.next_sequence(),
-                    output_index=self._output_index,
-                    item=self._completed_item,
-                )
-
-            # ── Turn end ──────────────────────────────────────────────────────
-            case SessionEvent(type=SessionEventType.ASSISTANT_TURN_END):
-                # Some models stream text entirely via ASSISTANT_MESSAGE_DELTA
-                # events without ever emitting a final ASSISTANT_MESSAGE.  In
-                # that case _completed_item is None but _accumulated_text holds
-                # the full text.  Synthesise the missing "done" events here so
-                # the client always gets a well-formed sequence.
-                logger.debug(
-                    f"ASSISTANT_TURN_END: _completed_item={'SET' if self._completed_item is not None else 'NONE'}, "
-                    f"_accumulated_text={len(self._accumulated_text)} chars"
-                )
-                if self._completed_item is None and self._accumulated_text:
-                    text = self._accumulated_text
-                    self._completed_item = ResponsesAssistantMessageItemResource(
-                        id=item_id,
-                        status="completed",
-                        content=[ItemContentOutputText(text=text, annotations=[])],
-                    )
-                    yield ResponseTextDoneEvent(
-                        sequence_number=self.next_sequence(),
-                        item_id=item_id,
-                        output_index=self._output_index,
-                        content_index=0,
-                        text=text,
-                    )
-                    yield ResponseContentPartDoneEvent(
-                        sequence_number=self.next_sequence(),
-                        item_id=item_id,
-                        output_index=self._output_index,
-                        content_index=0,
-                        part=ItemContentOutputText(text=text, annotations=[]),
-                    )
-                    yield ResponseOutputItemDoneEvent(
-                        sequence_number=self.next_sequence(),
-                        output_index=self._output_index,
-                        item=self._completed_item,
-                    )
-
-                if self._completed_item is not None:
-                    # Defer response.completed until ASSISTANT_USAGE arrives so
-                    # token counts can be embedded.  SESSION_IDLE is the fallback.
-                    self._pending_completed = True
-                else:
-                    logger.debug("ASSISTANT_TURN_END with no text content (tool-calling turn) — skipping response.completed")
-
-            # ── Token / model usage ───────────────────────────────────────────
+            # ── Token / model usage (arrives BEFORE ASSISTANT_MESSAGE) ────────
             case SessionEvent(type=SessionEventType.ASSISTANT_USAGE, data=data) if data:
-                # Store usage so it can be embedded in the final response.completed.
                 usage: Dict[str, Any] = {}
                 if data.input_tokens is not None:
                     usage["input_tokens"] = int(data.input_tokens)
@@ -329,110 +194,87 @@ class CopilotStreamingResponseConverter:
                     usage["total_tokens"] = total
                 if usage:
                     self._usage = usage
-                    logger.debug(f"Usage recorded: {usage}")
-                # Emit response.completed if ASSISTANT_TURN_END was already seen.
-                if self._pending_completed and self._completed_item is not None:
-                    self._pending_completed = False
-                    self._response_completed = True
-                    yield ResponseCompletedEvent(
+
+            # ── Full assistant message (authoritative, always emitted) ────────
+            case SessionEvent(type=SessionEventType.ASSISTANT_MESSAGE, data=data) if data and data.content:
+                text = data.content
+
+                if not self._accumulated_text:
+                    self._accumulated_text = text
+                    yield ResponseTextDeltaEvent(
                         sequence_number=self.next_sequence(),
-                        response=self._build_response(
-                            "completed",
-                            output=[self._completed_item],
-                            usage=self._usage,
-                        ),
+                        item_id=item_id,
+                        output_index=0,
+                        content_index=0,
+                        delta=text,
                     )
 
-            # ── Session idle: emit any deferred response.completed ─────────────
+                completed_item = ResponsesAssistantMessageItemResource(
+                    id=item_id,
+                    status="completed",
+                    content=[ItemContentOutputText(text=text, annotations=[])],
+                )
+
+                yield ResponseTextDoneEvent(
+                    sequence_number=self.next_sequence(),
+                    item_id=item_id,
+                    output_index=0,
+                    content_index=0,
+                    text=text,
+                )
+                yield ResponseContentPartDoneEvent(
+                    sequence_number=self.next_sequence(),
+                    item_id=item_id,
+                    output_index=0,
+                    content_index=0,
+                    part=ItemContentOutputText(text=text, annotations=[]),
+                )
+                yield ResponseOutputItemDoneEvent(
+                    sequence_number=self.next_sequence(),
+                    output_index=0,
+                    item=completed_item,
+                )
+                yield ResponseCompletedEvent(
+                    sequence_number=self.next_sequence(),
+                    response=self._build_response(
+                        "completed",
+                        output=[completed_item],
+                        usage=self._usage,
+                    ),
+                )
+                self._completed = True
+
+            # ── Turn end (no-op; completion already emitted from ASSISTANT_MESSAGE)
+            case SessionEvent(type=SessionEventType.ASSISTANT_TURN_END):
+                pass
+
+            # ── Session idle (safety net) ─────────────────────────────────────
             case SessionEvent(type=SessionEventType.SESSION_IDLE):
-                if self._response_completed:
-                    # Already completed via ASSISTANT_USAGE — nothing to do.
-                    pass
-                elif self._pending_completed and self._completed_item is not None:
-                    # Normal fallback: ASSISTANT_USAGE did not arrive before SESSION_IDLE.
-                    self._pending_completed = False
-                    self._response_completed = True
-                    yield ResponseCompletedEvent(
-                        sequence_number=self.next_sequence(),
-                        response=self._build_response(
-                            "completed",
-                            output=[self._completed_item],
-                            usage=self._usage,
-                        ),
-                    )
-                elif self._turn_count > 0:
-                    # Abnormal path: SESSION_IDLE arrived without a proper completion
-                    # signal.  This can happen when the model emits only reasoning (no
-                    # text), when SESSION_IDLE fires before ASSISTANT_TURN_END, or when
-                    # a tool-calling turn ends without a text response.  We force a
-                    # response.completed so the client stream always terminates cleanly.
-                    logger.warning(
-                        "SESSION_IDLE before response.completed (pending=%s, item=%s, text=%d chars) — "
-                        "forcing completion",
-                        self._pending_completed,
-                        "SET" if self._completed_item is not None else "NONE",
-                        len(self._accumulated_text),
-                    )
-                    # If we have accumulated delta text but the done events were never
-                    # emitted, synthesise them now before completing.
-                    if self._accumulated_text and self._completed_item is None:
-                        text = self._accumulated_text
-                        self._completed_item = ResponsesAssistantMessageItemResource(
+                if not self._completed and self._turn_count > 0:
+                    logger.warning("SESSION_IDLE without response.completed — forcing completion")
+                    output: list = []
+                    if self._accumulated_text:
+                        completed_item = ResponsesAssistantMessageItemResource(
                             id=item_id,
                             status="completed",
-                            content=[ItemContentOutputText(text=text, annotations=[])],
+                            content=[ItemContentOutputText(text=self._accumulated_text, annotations=[])],
                         )
-                        yield ResponseTextDoneEvent(
-                            sequence_number=self.next_sequence(),
-                            item_id=item_id,
-                            output_index=self._output_index,
-                            content_index=0,
-                            text=text,
-                        )
-                        yield ResponseContentPartDoneEvent(
-                            sequence_number=self.next_sequence(),
-                            item_id=item_id,
-                            output_index=self._output_index,
-                            content_index=0,
-                            part=ItemContentOutputText(text=text, annotations=[]),
-                        )
-                        yield ResponseOutputItemDoneEvent(
-                            sequence_number=self.next_sequence(),
-                            output_index=self._output_index,
-                            item=self._completed_item,
-                        )
-                    self._response_completed = True
-                    output = [self._completed_item] if self._completed_item else []
+                        output = [completed_item]
                     yield ResponseCompletedEvent(
                         sequence_number=self.next_sequence(),
-                        response=self._build_response(
-                            "completed",
-                            output=output,
-                            usage=self._usage,
-                        ),
+                        response=self._build_response("completed", output=output, usage=self._usage),
                     )
+                    self._completed = True
 
-            # ── Reasoning (extended thinking) ─────────────────────────────────
+            # ── Reasoning ─────────────────────────────────────────────────────
             case SessionEvent(type=SessionEventType.ASSISTANT_REASONING, data=data):
-                # TODO: Emit a reasoning output item so the client sees the correct
-                # output_index structure (reasoning at N, message at N+1).
-                # The message output_item.added was already emitted in TURN_START
-                # at index self._output_index; bump it now and insert the reasoning
-                # item BEFORE it by emitting an item at the bumped index instead.
-                # Because TURN_START always fires before REASONING, we emit the
-                # message item in TURN_START at index 0 then insert reasoning at
-                # index 0 (re-numbering). Rather than retroactively re-numbering,
-                # we simply emit the reasoning item at the NEXT available index
-                # (as an informational item) and log the content at DEBUG.
                 if data and data.content:
-                    logger.debug(f"Copilot reasoning (skipped): {data.content[:120]!r}")
-                else:
-                    logger.debug("ASSISTANT_REASONING event (no content)")
+                    logger.debug(f"Copilot reasoning: {data.content[:120]!r}")
 
             # ── All other events ──────────────────────────────────────────────
             case _:
                 ename = event.type.name if event.type else "UNKNOWN"
-                logger.debug(f"Unhandled Copilot event (skipped): {ename}")
+                logger.debug(f"Unhandled Copilot event: {ename}")
 
     # ------------------------------------------------------------------
     # Legacy shim kept for any existing call sites

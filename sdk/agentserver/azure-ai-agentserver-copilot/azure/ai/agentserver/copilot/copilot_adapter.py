@@ -221,22 +221,15 @@ class CopilotAdapter(FoundryCBAgent):
             span_attrs["gen_ai.conversation.id"] = conversation_id
 
         if not context.stream:
-            # Non-streaming: collect all events to extract the final text.
-            # Prefer the authoritative ASSISTANT_MESSAGE if one arrives; fall back
-            # to accumulating ASSISTANT_MESSAGE_DELTA events for models that never
-            # emit a final ASSISTANT_MESSAGE (delta-only models).
+            # Non-streaming: collect all events and extract the final text
+            # from the authoritative ASSISTANT_MESSAGE event.
             text = ""
-            delta_parts: list[str] = []
             try:
                 async for event in _iter_copilot_events(session, prompt, attachments=converted_attachments.attachments):
                     if event.type == SessionEventType.ASSISTANT_MESSAGE and event.data and event.data.content:
-                        text = event.data.content  # authoritative — use this if present
-                    elif event.type == SessionEventType.ASSISTANT_MESSAGE_DELTA and event.data and event.data.content:
-                        delta_parts.append(event.data.content)  # fallback accumulation
+                        text = event.data.content
             finally:
                 converted_attachments.cleanup()
-            if not text and delta_parts:
-                text = "".join(delta_parts)
             return CopilotResponseConverter.to_response(text, context)
 
         # Streaming: return an async generator so events flow to the client
