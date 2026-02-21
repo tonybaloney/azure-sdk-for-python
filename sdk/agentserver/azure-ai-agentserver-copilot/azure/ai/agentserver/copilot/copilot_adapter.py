@@ -9,7 +9,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
-from copilot.generated.session_events import SessionEventType
+from copilot.generated.session_events import Data, SessionEvent, SessionEventType
 from copilot.types import PermissionRequest, PermissionRequestResult, ResumeSessionConfig
 from opentelemetry import context as otel_context, trace
 
@@ -263,9 +263,32 @@ class CopilotAdapter(FoundryCBAgent):
         token = otel_context.attach(trace.set_span_in_context(span))
         # tool_call_id → (child_span, otel_token) for in-flight tool executions
         tool_spans: Dict[str, Any] = {}
+        # When FORCE_DELTA_ONLY=1, transform ASSISTANT_MESSAGE events into
+        # ASSISTANT_MESSAGE_DELTA events (without a final ASSISTANT_MESSAGE) to
+        # simulate models that stream text exclusively via deltas.  This
+        # exercises the ASSISTANT_TURN_END synthesis path in testing.
+        _force_delta_only = os.getenv("FORCE_DELTA_ONLY") == "1"
+
         try:
             converter = CopilotStreamingResponseConverter(context)
             async for copilot_event in _iter_copilot_events(session, prompt, attachments=converted_attachments.attachments):
+                if _force_delta_only and copilot_event.type == SessionEventType.ASSISTANT_MESSAGE:
+                    msg_content = copilot_event.data.content if copilot_event.data else None
+                    if msg_content:
+                        logger.info("FORCE_DELTA_ONLY: converting ASSISTANT_MESSAGE → ASSISTANT_MESSAGE_DELTA (no final message)")
+                        # Re-emit as a delta so _accumulated_text gets populated,
+                        # then drop the original so no _completed_item is set.
+                        fake_delta = SessionEvent(
+                            data=Data(content=msg_content),
+                            id=copilot_event.id,
+                            timestamp=copilot_event.timestamp,
+                            type=SessionEventType.ASSISTANT_MESSAGE_DELTA,
+                        )
+                        for rapi_event in converter._convert_event(fake_delta, context):
+                            yield rapi_event
+                    else:
+                        logger.info("FORCE_DELTA_ONLY: dropping empty ASSISTANT_MESSAGE")
+                    continue  # skip normal processing
                 data = copilot_event.data
 
                 # ── Tool execution start: open a child span ────────────────────

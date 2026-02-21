@@ -269,6 +269,10 @@ class CopilotStreamingResponseConverter:
                 # that case _completed_item is None but _accumulated_text holds
                 # the full text.  Synthesise the missing "done" events here so
                 # the client always gets a well-formed sequence.
+                logger.info(
+                    f"ASSISTANT_TURN_END: _completed_item={'SET' if self._completed_item is not None else 'NONE'}, "
+                    f"_accumulated_text={len(self._accumulated_text)} chars"
+                )
                 if self._completed_item is None and self._accumulated_text:
                     text = self._accumulated_text
                     self._completed_item = ResponsesAssistantMessageItemResource(
