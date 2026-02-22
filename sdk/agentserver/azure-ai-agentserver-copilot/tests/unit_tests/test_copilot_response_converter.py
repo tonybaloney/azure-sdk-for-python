@@ -14,6 +14,7 @@ from azure.ai.agentserver.core.models.projects import (
     ResponseCompletedEvent,
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
+    ResponseFailedEvent,
     ResponseInProgressEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
@@ -421,9 +422,26 @@ class TestSessionIdleSafetyNet:
         events = list(converter._convert_event(_make_event(SessionEventType.SESSION_IDLE), context))
         assert len(events) == 0
 
-    def test_session_error_then_idle_includes_error_text(self):
-        """When SESSION_ERROR fires before SESSION_IDLE, the safety-net
-        response must contain the error message, not blank text."""
+    def test_session_error_emits_response_failed(self):
+        """SESSION_ERROR should emit a response.failed event with the error message."""
+        context = _make_context()
+        converter = CopilotStreamingResponseConverter(context)
+        events = []
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_START), context))
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context))
+        events.extend(converter._convert_event(
+            _make_event(SessionEventType.SESSION_ERROR, message="Model overloaded"), context
+        ))
+
+        failed = [e for e in events if isinstance(e, ResponseFailedEvent)]
+        assert len(failed) == 1
+        assert failed[0].response["status"] == "failed"
+        assert failed[0].response["error"].code == "server_error"
+        assert "Model overloaded" in failed[0].response["error"].message
+
+    def test_session_error_then_idle_no_double_emit(self):
+        """After SESSION_ERROR emits response.failed, SESSION_IDLE should NOT
+        also emit response.completed — only one terminal event."""
         context = _make_context()
         converter = CopilotStreamingResponseConverter(context)
         events = []
@@ -434,17 +452,10 @@ class TestSessionIdleSafetyNet:
         ))
         events.extend(converter._convert_event(_make_event(SessionEventType.SESSION_IDLE), context))
 
+        failed = [e for e in events if isinstance(e, ResponseFailedEvent)]
         completed = [e for e in events if isinstance(e, ResponseCompletedEvent)]
-        assert len(completed) == 1
-        # The response text must include the error message
-        output = completed[0].response.output
-        assert len(output) == 1
-        assert "Model overloaded" in output[0].content[0].text
-
-        # Verify text delta was also emitted with the error
-        text_deltas = [e for e in events if isinstance(e, ResponseTextDeltaEvent)]
-        assert len(text_deltas) == 1
-        assert "Model overloaded" in text_deltas[0].delta
+        assert len(failed) == 1
+        assert len(completed) == 0  # safety net must not fire after response.failed
 
     def test_session_error_stores_message_attribute(self):
         """SESSION_ERROR with data.message should be captured."""
@@ -476,11 +487,12 @@ class TestFullEventSequence:
             "response.content_part.added",
             # USAGE produces no RAPI events
             "response.output_text.delta",       # synthetic delta from MESSAGE
+            # TURN_END emits deferred done-events
             "response.output_text.done",
             "response.content_part.done",
             "response.output_item.done",
             "response.completed",
-            # TURN_END + SESSION_IDLE produce nothing
+            # SESSION_IDLE produces nothing
         ]
         assert types == expected
 
@@ -497,6 +509,7 @@ class TestFullEventSequence:
             "response.output_text.delta",       # delta "B"
             # USAGE produces no RAPI events
             # MESSAGE: no synthetic delta (already have deltas)
+            # TURN_END emits deferred done-events
             "response.output_text.done",
             "response.content_part.done",
             "response.output_item.done",

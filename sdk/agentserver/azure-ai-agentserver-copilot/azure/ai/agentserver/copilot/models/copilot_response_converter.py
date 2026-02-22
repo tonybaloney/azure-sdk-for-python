@@ -14,6 +14,8 @@ from azure.ai.agentserver.core.models.projects import (
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
+    ResponseError,
+    ResponseFailedEvent,
     ResponseInProgressEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
@@ -70,8 +72,12 @@ class CopilotStreamingResponseConverter:
     In multi-turn (tool-calling) flows the turn sequence repeats.  Only the
     final turn that produces text content gets ``response.completed``.
 
-    The converter is intentionally simple: each Copilot event maps to a fixed
-    set of RAPI events with no deferred state or pending flags.
+    To avoid a burst-then-close race at the Container App ingress layer,
+    done-events (text_done → content_part.done → output_item.done →
+    response.completed) are **deferred** from ``ASSISTANT_MESSAGE`` to
+    ``ASSISTANT_TURN_END``.  This ensures they are yielded in a separate
+    async iteration of the event loop, giving uvicorn time to flush the
+    earlier chunks before the connection closes.
     """
 
     def __init__(self, context: AgentRunContext):
@@ -83,6 +89,9 @@ class CopilotStreamingResponseConverter:
         self._item_id: str = context.id_generator.generate_message_id()
         self._usage: Optional[Dict[str, Any]] = None
         self._completed: bool = False
+        self._failed: bool = False
+        self._session_error: Optional[str] = None
+        self._pending_message_text: Optional[str] = None
 
     def next_sequence(self) -> int:
         self._sequence += 1
@@ -93,6 +102,7 @@ class CopilotStreamingResponseConverter:
         status: str,
         output: Optional[list] = None,
         usage: Optional[Dict[str, Any]] = None,
+        error: Optional[ResponseError] = None,
     ) -> OpenAIResponse:
         """Build a Response dict with all required fields, matching the langgraph/agentframework pattern."""
         response_data: Dict[str, Any] = {
@@ -111,6 +121,8 @@ class CopilotStreamingResponseConverter:
             response_data["output"] = output
         if usage is not None:
             response_data["usage"] = usage
+        if error is not None:
+            response_data["error"] = error
         return OpenAIResponse(response_data)
 
     # ------------------------------------------------------------------
@@ -196,6 +208,9 @@ class CopilotStreamingResponseConverter:
                     self._usage = usage
 
             # ── Full assistant message (authoritative, always emitted) ────────
+            # Only emit a synthetic delta here if no streaming deltas arrived.
+            # Done-events are deferred to ASSISTANT_TURN_END so they cross an
+            # async boundary, preventing a burst-then-close race at the proxy.
             case SessionEvent(type=SessionEventType.ASSISTANT_MESSAGE, data=data) if data and data.content:
                 text = data.content
 
@@ -209,57 +224,113 @@ class CopilotStreamingResponseConverter:
                         delta=text,
                     )
 
-                completed_item = ResponsesAssistantMessageItemResource(
-                    id=item_id,
-                    status="completed",
-                    content=[ItemContentOutputText(text=text, annotations=[])],
-                )
+                # Store text — done-events emitted by ASSISTANT_TURN_END.
+                self._pending_message_text = text
 
-                yield ResponseTextDoneEvent(
-                    sequence_number=self.next_sequence(),
-                    item_id=item_id,
-                    output_index=0,
-                    content_index=0,
-                    text=text,
-                )
-                yield ResponseContentPartDoneEvent(
-                    sequence_number=self.next_sequence(),
-                    item_id=item_id,
-                    output_index=0,
-                    content_index=0,
-                    part=ItemContentOutputText(text=text, annotations=[]),
-                )
-                yield ResponseOutputItemDoneEvent(
-                    sequence_number=self.next_sequence(),
-                    output_index=0,
-                    item=completed_item,
-                )
-                yield ResponseCompletedEvent(
-                    sequence_number=self.next_sequence(),
-                    response=self._build_response(
-                        "completed",
-                        output=[completed_item],
-                        usage=self._usage,
-                    ),
-                )
-                self._completed = True
+            # ── Session error ───────────────────────────────────────────
+            case SessionEvent(type=SessionEventType.SESSION_ERROR, data=data):
+                error_msg = ""
+                if data:
+                    error_msg = getattr(data, 'message', None) or getattr(data, 'content', None) or repr(data)
+                self._session_error = error_msg
+                logger.error(f"Copilot session error: {error_msg}")
 
-            # ── Turn end (no-op; completion already emitted from ASSISTANT_MESSAGE)
+                if not self._completed and not self._failed:
+                    error_obj = ResponseError(code="server_error", message=error_msg)
+                    yield ResponseFailedEvent(
+                        sequence_number=self.next_sequence(),
+                        response=self._build_response("failed", error=error_obj),
+                    )
+                    self._failed = True
+
+            # ── Turn end — emit deferred done-events ─────────────────────────
+            # Done-events are deferred here (instead of ASSISTANT_MESSAGE) so
+            # they are yielded in a separate async iteration, giving the proxy
+            # layer time to flush earlier SSE chunks.
             case SessionEvent(type=SessionEventType.ASSISTANT_TURN_END):
-                pass
+                if self._pending_message_text is not None:
+                    text = self._pending_message_text
+                    self._pending_message_text = None
+
+                    completed_item = ResponsesAssistantMessageItemResource(
+                        id=item_id,
+                        status="completed",
+                        content=[ItemContentOutputText(text=text, annotations=[])],
+                    )
+
+                    yield ResponseTextDoneEvent(
+                        sequence_number=self.next_sequence(),
+                        item_id=item_id,
+                        output_index=0,
+                        content_index=0,
+                        text=text,
+                    )
+                    yield ResponseContentPartDoneEvent(
+                        sequence_number=self.next_sequence(),
+                        item_id=item_id,
+                        output_index=0,
+                        content_index=0,
+                        part=ItemContentOutputText(text=text, annotations=[]),
+                    )
+                    yield ResponseOutputItemDoneEvent(
+                        sequence_number=self.next_sequence(),
+                        output_index=0,
+                        item=completed_item,
+                    )
+                    yield ResponseCompletedEvent(
+                        sequence_number=self.next_sequence(),
+                        response=self._build_response(
+                            "completed",
+                            output=[completed_item],
+                            usage=self._usage,
+                        ),
+                    )
+                    self._completed = True
 
             # ── Session idle (safety net) ─────────────────────────────────────
             case SessionEvent(type=SessionEventType.SESSION_IDLE):
-                if not self._completed and self._turn_count > 0:
+                if not self._completed and not self._failed and self._turn_count > 0:
                     logger.warning("SESSION_IDLE without response.completed — forcing completion")
-                    output: list = []
-                    if self._accumulated_text:
-                        completed_item = ResponsesAssistantMessageItemResource(
-                            id=item_id,
-                            status="completed",
-                            content=[ItemContentOutputText(text=self._accumulated_text, annotations=[])],
-                        )
-                        output = [completed_item]
+                    # Use accumulated text, or error message, or fallback.
+                    text = self._accumulated_text
+                    if not text.strip():
+                        if self._session_error:
+                            text = f"(Agent error: {self._session_error})"
+                        else:
+                            text = "(No response text was produced by the agent.)"
+                    completed_item = ResponsesAssistantMessageItemResource(
+                        id=item_id,
+                        status="completed",
+                        content=[ItemContentOutputText(text=text, annotations=[])],
+                    )
+                    output = [completed_item]
+                    # Emit the full done-event chain so clients see well-formed output.
+                    yield ResponseTextDeltaEvent(
+                        sequence_number=self.next_sequence(),
+                        item_id=item_id,
+                        output_index=0,
+                        content_index=0,
+                        delta=text,
+                    )
+                    yield ResponseTextDoneEvent(
+                        sequence_number=self.next_sequence(),
+                        item_id=item_id,
+                        output_index=0,
+                        content_index=0,
+                        text=text,
+                    )
+                    yield ResponseContentPartDoneEvent(
+                        sequence_number=self.next_sequence(),
+                        item_id=item_id,
+                        output_index=0,
+                        content_index=0,
+                        part=ItemContentOutputText(text=text, annotations=[]),
+                    )
+                    yield ResponseOutputItemDoneEvent(
+                        sequence_number=self.next_sequence(),
+                        output_index=0,
+                        item=completed_item,
+                    )
                     yield ResponseCompletedEvent(
                         sequence_number=self.next_sequence(),
                         response=self._build_response("completed", output=output, usage=self._usage),
