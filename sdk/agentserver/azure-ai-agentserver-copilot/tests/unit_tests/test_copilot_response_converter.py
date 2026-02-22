@@ -421,6 +421,40 @@ class TestSessionIdleSafetyNet:
         events = list(converter._convert_event(_make_event(SessionEventType.SESSION_IDLE), context))
         assert len(events) == 0
 
+    def test_session_error_then_idle_includes_error_text(self):
+        """When SESSION_ERROR fires before SESSION_IDLE, the safety-net
+        response must contain the error message, not blank text."""
+        context = _make_context()
+        converter = CopilotStreamingResponseConverter(context)
+        events = []
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_START), context))
+        events.extend(converter._convert_event(_make_event(SessionEventType.ASSISTANT_TURN_END), context))
+        events.extend(converter._convert_event(
+            _make_event(SessionEventType.SESSION_ERROR, message="Model overloaded"), context
+        ))
+        events.extend(converter._convert_event(_make_event(SessionEventType.SESSION_IDLE), context))
+
+        completed = [e for e in events if isinstance(e, ResponseCompletedEvent)]
+        assert len(completed) == 1
+        # The response text must include the error message
+        output = completed[0].response.output
+        assert len(output) == 1
+        assert "Model overloaded" in output[0].content[0].text
+
+        # Verify text delta was also emitted with the error
+        text_deltas = [e for e in events if isinstance(e, ResponseTextDeltaEvent)]
+        assert len(text_deltas) == 1
+        assert "Model overloaded" in text_deltas[0].delta
+
+    def test_session_error_stores_message_attribute(self):
+        """SESSION_ERROR with data.message should be captured."""
+        context = _make_context()
+        converter = CopilotStreamingResponseConverter(context)
+        list(converter._convert_event(
+            _make_event(SessionEventType.SESSION_ERROR, message="auth failure"), context
+        ))
+        assert converter._session_error == "auth failure"
+
 
 # ---------------------------------------------------------------------------
 # Full event sequence validation
