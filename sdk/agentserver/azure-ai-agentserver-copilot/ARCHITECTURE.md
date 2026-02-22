@@ -1,20 +1,20 @@
 # Copilot SDK Adapter — Architecture Overview
 
 This document provides a high-level technical overview of the GitHub Copilot
-SDK adapter for Azure AI Agent Server.  For detailed streaming protocol
+SDK adapter for Microsoft Foundry Agent Server.  For detailed streaming protocol
 implementation, see [DESIGN.md](DESIGN.md).
 
 ## Executive Summary
 
 The Copilot adapter enables GitHub Copilot's AI capabilities — including tool
 execution, multi-turn conversations, and code understanding — to be deployed
-as a **hosted agent** on Azure AI Foundry.  Clients interact using the
+as a **hosted agent** on Microsoft Foundry.  Clients interact using the
 standard OpenAI Responses API; the adapter translates between the two
 protocols transparently.
 
 ```mermaid
 flowchart TB
-    subgraph foundry["Azure AI Foundry"]
+    subgraph foundry["Microsoft Foundry"]
         subgraph container["Hosted Agent Container"]
             adapter["CopilotAdapter<br/>(FoundryCBAgent)"]
             copilot["CopilotClient<br/>(SDK session)"]
@@ -25,7 +25,7 @@ flowchart TB
             adapter --> converter
         end
         clients["Clients<br/>(OpenAI SDK)"] <-->|"HTTP / SSE"| adapter
-        models[("Azure OpenAI /<br/>GitHub Models")]
+        models[("Foundry Models /<br/>GitHub API")]
         copilot --> models
     end
 ```
@@ -234,7 +234,7 @@ python main.py
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AZURE_AI_FOUNDRY_RESOURCE_URL` | For BYOK | Azure AI Foundry endpoint |
+| `AZURE_AI_FOUNDRY_RESOURCE_URL` | For BYOK | Microsoft Foundry endpoint |
 | `AZURE_AI_FOUNDRY_API_KEY` | No | Static API key (dev only) |
 | `COPILOT_MODEL` | No | Model deployment name (`gpt-5.1-chat`) |
 | `TOOL_ACL_PATH` | Recommended | Path to YAML ACL file |
@@ -424,7 +424,7 @@ efficiency.
 
 ### 9. Platform Infrastructure Bug (Streaming)
 
-**Observed behaviour:** The RAPI gateway (Azure AI Foundry + Container Apps
+**Observed behaviour:** The RAPI gateway (Foundry + Container Apps
 ingress) drops the final events of every SSE stream.  Events
 `response.output_text.done` through `response.completed` and `data: [DONE]`
 are consistently truncated.  This affects *all* hosted agent adapters
