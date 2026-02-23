@@ -1,0 +1,77 @@
+# =============================================================================
+# A2A Agent Card Configuration
+# =============================================================================
+#
+# This file defines the agent's identity and capabilities for A2A protocol
+# discovery. It is loaded at startup and served at /.well-known/agent-card.json.
+#
+# Set A2A_AGENT_CARD_PATH environment variable to override the default location.
+#
+# Schema Reference: https://google.github.io/A2A/#agent-card
+# =============================================================================
+
+# Agent identity
+name: "copilot-hosted-agent"
+description: "GitHub Copilot SDK powered agent hosted on Azure AI Foundry"
+version: "1.0.0"
+
+# Input/output modes supported
+defaultInputModes:
+  - "text/plain"
+defaultOutputModes:
+  - "text/plain"
+  - "application/json"
+
+# Capabilities
+capabilities:
+  streaming: true           # Supports SSE streaming via /message:stream
+  pushNotifications: false  # Does not support webhooks
+
+# Skills advertised to clients
+skills:
+  - id: "code-assistant"
+    name: "Code Assistant"
+    description: "Help with coding tasks, code review, explanations, and debugging"
+    tags:
+      - "coding"
+      - "programming"
+      - "ai"
+      - "assistant"
+
+  - id: "shell-execution"
+    name: "Shell Execution"
+    description: "Execute shell commands in a sandboxed environment (subject to ACL rules)"
+    tags:
+      - "tools"
+      - "shell"
+      - "automation"
+      - "terminal"
+
+  - id: "file-operations"
+    name: "File Operations"
+    description: "Read and write files in the workspace (subject to ACL rules)"
+    tags:
+      - "tools"
+      - "files"
+      - "filesystem"
+
+  - id: "web-fetch"
+    name: "Web Fetch"
+    description: "Fetch content from URLs (subject to ACL allowlist)"
+    tags:
+      - "tools"
+      - "web"
+      - "http"
+
+  - id: "mcp-tools"
+    name: "MCP Tools"
+    description: "Invoke Model Context Protocol tools from connected servers"
+    tags:
+      - "tools"
+      - "mcp"
+      - "extensibility"
+
+# Authentication (gateway-level, not agent-level)
+# The agent relies on Azure AI Foundry gateway authentication.
+# Direct A2A client authentication is not implemented.
+# securitySchemes: []

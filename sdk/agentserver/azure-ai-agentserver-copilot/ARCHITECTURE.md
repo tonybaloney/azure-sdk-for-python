@@ -296,6 +296,176 @@ logged at WARNING level with full details.
 
 ---
 
+## Dual-Protocol Architecture (A2A + RAPI)
+
+The adapter can expose **both** the OpenAI Responses API and the
+[A2A (Agent-to-Agent)](https://a2a-protocol.org/) protocol simultaneously,
+allowing clients to choose which interface suits their needs.
+
+### Why Dual-Protocol?
+
+| Use Case | Recommended Protocol |
+|----------|---------------------|
+| OpenAI SDK compatibility | RAPI |
+| Tool execution visibility | A2A |
+| Sub-agent delegation | A2A |
+| Interactive approvals | A2A |
+| Simple chat flows | Either |
+| Rich content types | A2A |
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph container["Hosted Agent Container (port 8088)"]
+        subgraph protocols["Protocol Handlers"]
+            rapi["RAPI Handler<br/>/responses"]
+            a2a["A2A Handler<br/>/message:send<br/>/message:stream"]
+            card["Agent Card<br/>/.well-known/agent-card.json"]
+        end
+        
+        adapter["CopilotAdapter"]
+        copilot["CopilotClient"]
+        
+        rapi --> adapter
+        a2a --> adapter
+        adapter --> copilot
+    end
+    
+    openai_client["OpenAI SDK<br/>Clients"] -->|"POST /responses"| rapi
+    a2a_client["A2A Clients"] -->|"POST /message:stream"| a2a
+    a2a_client -->|"GET"| card
+```
+
+### Endpoint Mapping
+
+| Endpoint | Protocol | Purpose |
+|----------|----------|---------|
+| `POST /responses` | RAPI | OpenAI Responses API (existing) |
+| `POST /runs` | RAPI | Alias for `/responses` |
+| `GET /.well-known/agent-card.json` | A2A | Agent discovery |
+| `POST /message:send` | A2A | Non-streaming message |
+| `POST /message:stream` | A2A | Streaming message (SSE) |
+| `GET /tasks/{id}` | A2A | Task status retrieval |
+
+### Implementation
+
+The adapter adds A2A routes to the underlying Starlette app at startup when
+`ENABLE_A2A_PROTOCOL` is `true` (the default). Key implementation files:
+
+| File | Purpose |
+|------|---------|
+| `a2a_types.py` | A2A protocol data structures (Task, Artifact, Message, AgentCard) |
+| `a2a_response_converter.py` | Copilot → A2A event conversion + agent card loader |
+| `copilot_adapter.py` | Route handlers in `_setup_a2a_routes()` |
+
+### Agent Card Configuration
+
+The agent card is loaded from a YAML file (`agent_card.yaml`) with fallback
+to environment variables and built-in defaults:
+
+```yaml
+# agent_card.yaml
+name: "copilot-hosted-agent"
+description: "GitHub Copilot SDK powered agent"
+version: "1.0.0"
+
+capabilities:
+  streaming: true
+  pushNotifications: false
+
+skills:
+  - id: "code-assistant"
+    name: "Code Assistant"
+    description: "Help with coding tasks"
+    tags: ["coding", "ai"]
+  - id: "shell-execution"
+    name: "Shell Execution"
+    description: "Execute shell commands (subject to ACL)"
+    tags: ["tools", "shell"]
+```
+
+Priority order: explicit parameters → environment variables → YAML file → defaults.
+
+### Event Conversion: Copilot → A2A
+
+The A2A protocol can represent all Copilot events that RAPI cannot:
+
+| Copilot Event | A2A Representation |
+|---------------|-------------------|
+| `TOOL_EXECUTION_START` | `TaskStatus(state=WORKING)` + status message |
+| `TOOL_EXECUTION_PROGRESS` | `TaskStatus` update with progress text |
+| `TOOL_EXECUTION_COMPLETE` | `Artifact` with tool result |
+| `SUBAGENT_STARTED` | `TaskStatus` with agent context |
+| `SESSION_MODEL_CHANGE` | Metadata in task status |
+| `ASSISTANT_REASONING` | `Artifact` with reasoning (opt-in) |
+| `ASSISTANT_MESSAGE_DELTA` | Streaming `Part` in response |
+
+### A2A OTEL Tracing
+
+Both RAPI and A2A handlers emit OpenTelemetry spans following the
+[GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/):
+
+**Parent span:** `invoke_agent {agent_name}`
+- `gen_ai.operation.name`: `"invoke_agent"`
+- `gen_ai.agent.name`: agent identifier
+- `gen_ai.request.model`: requested model
+- `gen_ai.response.model`: actual model used
+- `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`: token counts
+- `a2a.task.id`, `a2a.context.id`: A2A-specific context
+
+**Child spans:** `tools/call {tool_name}` (per tool execution)
+- `mcp.method.name`: `"tools/call"`
+- `gen_ai.tool.name`: tool identifier
+- `gen_ai.tool.call.id`: unique call ID
+- `gen_ai.tool.call.arguments`: serialized arguments
+- `gen_ai.tool.call.result`: truncated result (512 chars)
+- `mcp.server.name`: MCP server (when applicable)
+
+### A2A Task Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> SUBMITTED: message:send
+    SUBMITTED --> WORKING: Processing starts
+    WORKING --> WORKING: Tool execution / streaming
+    WORKING --> INPUT_REQUIRED: Approval needed
+    INPUT_REQUIRED --> WORKING: User approves
+    INPUT_REQUIRED --> CANCELED: User denies
+    WORKING --> COMPLETED: Final response
+    WORKING --> FAILED: Error
+    COMPLETED --> [*]
+    FAILED --> [*]
+    CANCELED --> [*]
+```
+
+### Authentication
+
+A2A endpoints use the same gateway-level authentication as RAPI. The Azure
+AI Foundry gateway validates `Authorization: Bearer <token>` headers before
+forwarding requests to the container. No additional authentication is
+implemented at the A2A endpoint level.
+
+### Configuration
+
+```yaml
+# Enable dual-protocol in environment
+ENABLE_A2A_PROTOCOL: "true"
+A2A_AGENT_CARD_PATH: "/app/agent_card.yaml"
+A2A_AGENT_NAME: "copilot-hosted-agent"
+A2A_EXPOSE_REASONING: "false"  # Opt-in to expose chain-of-thought
+```
+
+### Benefits Over RAPI-Only
+
+1. **Tool Transparency** — Clients see tool invocations as task status updates
+2. **Approval Flows** — `INPUT_REQUIRED` state enables interactive approval
+3. **Rich Artifacts** — Tool outputs become typed artifacts, not collapsed text
+4. **Progress Feedback** — Long-running tools report progress messages
+5. **Agent Discovery** — Standard agent card enables dynamic client discovery
+
+---
+
 ## RAPI Proxy Gaps — Copilot SDK Features Without RAPI Equivalents
 
 This section documents Copilot SDK capabilities that **cannot be expressed**

@@ -243,3 +243,113 @@ adapter = CopilotAdapter(acl=acl)
 The `TOOL_ACL_PATH` environment variable is checked automatically at
 startup; you do not need to pass `acl_path` explicitly when deploying via
 Docker / Foundry Agent Service.
+
+---
+
+## A2A Protocol Support
+
+The adapter supports the [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/)
+alongside the standard RAPI (OpenAI Responses API). A2A provides richer
+visibility into agent operations than RAPI, including tool execution status,
+typed artifacts, and task lifecycle events.
+
+### A2A Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/.well-known/agent-card.json` | GET | Agent discovery manifest |
+| `/message:stream` | POST | Streaming task execution (SSE) |
+| `/message:send` | POST | Non-streaming task execution |
+| `/tasks/{id}` | GET | Retrieve task status |
+
+### Agent Card Configuration
+
+The agent card (served at `/.well-known/agent-card.json`) describes your
+agent's identity and capabilities. Configure it via `agent_card.yaml`:
+
+```yaml
+# agent_card.yaml
+name: "my-agent"
+description: "My custom agent description"
+version: "2.0.0"
+
+defaultInputModes:
+  - "text/plain"
+defaultOutputModes:
+  - "text/plain"
+  - "application/json"
+
+capabilities:
+  streaming: true
+  pushNotifications: false
+
+skills:
+  - id: "my-skill"
+    name: "My Skill"
+    description: "What this skill does"
+    tags:
+      - "category"
+      - "feature"
+```
+
+### Agent Card YAML Schema
+
+```yaml
+# Required fields
+name: string              # Agent display name
+
+# Optional fields
+description: string       # Human-readable description
+version: string           # Semantic version (default: "1.0.0")
+
+# Input/output modes (default: ["text/plain"])
+defaultInputModes:
+  - "text/plain"
+  - "application/json"
+defaultOutputModes:
+  - "text/plain"
+  - "application/json"
+
+# Capabilities (defaults shown)
+capabilities:
+  streaming: true           # Supports /message:stream
+  pushNotifications: false  # Supports webhooks (not implemented)
+
+# Skills advertised to clients
+skills:
+  - id: string              # Unique skill identifier
+    name: string            # Display name
+    description: string     # What the skill does
+    tags:                   # Searchable tags
+      - string
+```
+
+### A2A Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `A2A_AGENT_CARD_PATH` | `agent_card.yaml` | Path to agent card YAML |
+| `A2A_AGENT_NAME` | *(from YAML)* | Override agent name |
+| `A2A_AGENT_DESCRIPTION` | *(from YAML)* | Override description |
+| `ENABLE_A2A_PROTOCOL` | `true` | Enable/disable A2A endpoints |
+
+### Testing A2A Endpoints
+
+**Get agent card:**
+```bash
+curl http://localhost:8088/.well-known/agent-card.json
+```
+
+**Streaming message:**
+```bash
+curl -N -X POST http://localhost:8088/message:stream \
+  -H "Content-Type: application/json" \
+  -d '{"message": {"parts": [{"type": "text", "text": "Hello!"}]}}'
+```
+
+**Non-streaming message:**
+```bash
+curl -X POST http://localhost:8088/message:send \
+  -H "Content-Type: application/json" \
+  -d '{"message": {"parts": [{"type": "text", "text": "Hello!"}]}}'
+```

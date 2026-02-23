@@ -386,3 +386,76 @@ Consider RAPI if:
 - Simple text-in/text-out flows dominate
 - Tool execution can remain opaque
 - Ecosystem tooling (SDKs, integrations) is a priority
+
+---
+
+## A2A Protocol Implementation
+
+The adapter implements the A2A protocol alongside RAPI, enabling clients to
+choose the protocol that best fits their requirements.
+
+### A2A Event Mapping
+
+The A2A converter (`a2a_response_converter.py`) translates Copilot events
+into A2A streaming events:
+
+| Copilot Event | A2A Event | Data |
+|---------------|-----------|------|
+| `ASSISTANT_TURN_START` | `task.status` | `state=WORKING` |
+| `ASSISTANT_MESSAGE_DELTA` | *(accumulated)* | Text buffered |
+| `ASSISTANT_MESSAGE` | `task.artifact` | Response text artifact |
+| `TOOL_EXECUTION_START` | `task.status` | Tool name in message |
+| `TOOL_EXECUTION_PROGRESS` | `task.status` | Progress text |
+| `TOOL_EXECUTION_COMPLETE` | `task.artifact` | Tool result artifact |
+| `SUBAGENT_STARTED` | `task.status` | Sub-agent context |
+| `SESSION_ERROR` | `task.status` | `state=FAILED` |
+| `SESSION_IDLE` | `task.status` | `state=COMPLETED` |
+
+### A2A Task States
+
+```
+SUBMITTED → WORKING → COMPLETED
+                   ↘ FAILED
+                   ↘ INPUT_REQUIRED → WORKING
+                                   ↘ CANCELED
+```
+
+### A2A Artifacts
+
+Tool executions and responses are represented as typed artifacts:
+
+```json
+{
+  "artifactId": "uuid",
+  "name": "Tool: list_files",
+  "parts": [
+    {"data": {"files": ["a.py", "b.py"]}, "mediaType": "application/json"}
+  ],
+  "description": "Tool execution result"
+}
+```
+
+### Agent Card Discovery
+
+The agent card at `/.well-known/agent-card.json` is loaded from YAML with
+the following resolution order:
+
+1. `A2A_AGENT_CARD_PATH` environment variable
+2. `./agent_card.yaml` (current directory)
+3. `/app/agent_card.yaml` (container path)
+4. Built-in default skills
+
+### OTEL Tracing Parity
+
+Both RAPI and A2A handlers emit identical OTEL span structures:
+
+```
+invoke_agent {agent_name}
+├── tools/call {tool_1}
+├── tools/call {tool_2}
+└── ...
+```
+
+A2A adds additional span attributes:
+- `a2a.task.id`: A2A task identifier
+- `a2a.context.id`: A2A context identifier

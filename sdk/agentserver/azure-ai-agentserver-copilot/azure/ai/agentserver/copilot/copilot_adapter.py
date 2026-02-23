@@ -7,12 +7,14 @@ import dataclasses
 import json
 import os
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
 from copilot.types import PermissionRequest, PermissionRequestResult, ResumeSessionConfig
 from opentelemetry import context as otel_context, trace
+from starlette.requests import Request
+from starlette.responses import Response, StreamingResponse
 
 from azure.ai.agentserver.core.constants import Constants
 from azure.ai.agentserver.core.logger import get_logger
@@ -104,15 +106,22 @@ class CopilotAdapter(FoundryCBAgent):
     Foundry models via BYOK with Managed Identity authentication.  Otherwise
     it falls back to the default GitHub Copilot models.
 
+    Supports dual-protocol mode:
+    - RAPI (OpenAI Responses API) on /responses
+    - A2A (Agent-to-Agent protocol) on /message:stream, /.well-known/agent-card.json
+
     :param session_config: Override for the Copilot session config.  When
         *None* the config is built automatically from environment variables.
     :type session_config: Optional[SessionConfig]
+    :param enable_a2a: Enable A2A protocol endpoints (default: True).
+    :type enable_a2a: bool
     """
 
     def __init__(
         self,
         session_config: Optional[SessionConfig] = None,
         acl: Optional[ToolAcl] = None,
+        enable_a2a: bool = True,
     ):
         super().__init__()
         self._session_config = session_config or _build_session_config()
@@ -135,11 +144,19 @@ class CopilotAdapter(FoundryCBAgent):
         # Multi-turn: map conversation_id → live CopilotSession
         self._sessions: Dict[str, Any] = {}
 
+        # A2A: task store for retrieval
+        self._a2a_tasks: Dict[str, Any] = {}
+        self._enable_a2a = enable_a2a or os.getenv("ENABLE_A2A_PROTOCOL", "true").lower() == "true"
+
         # Keep credential for token refresh when using Foundry with Managed Identity
         if os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL") and not os.getenv("AZURE_AI_FOUNDRY_API_KEY"):
             from azure.identity import DefaultAzureCredential
 
             self._credential = DefaultAzureCredential()
+
+        # Add A2A routes if enabled
+        if self._enable_a2a:
+            self._setup_a2a_routes()
 
     def _refresh_token_if_needed(self) -> SessionConfig:
         """Return the session config, refreshing the bearer token if using Foundry."""
@@ -344,6 +361,13 @@ class CopilotAdapter(FoundryCBAgent):
                 # Yield RAPI events immediately — 0..N per Copilot event
                 for rapi_event in converter._convert_event(copilot_event, context):
                     yield rapi_event
+
+            # NOTE: The RAPI gateway/Container App ingress currently drops
+            # the final SSE events (text_done → completed → [DONE]) regardless
+            # of how long the adapter waits before closing.  A sleep here does
+            # NOT help — tested up to 2 seconds with no effect.  The issue is
+            # in the platform infrastructure, not timing.
+
             span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
         except Exception as e:
             span.set_attribute("error.type", type(e).__name__)
@@ -416,6 +440,12 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
             logger.info(f"Copilot event #{event_count:03d}: {event_name} content_len={len(text)}")
         else:
             logger.info(f"Copilot event #{event_count:03d}: {event_name}")
+
+        # Always log SESSION_ERROR details at WARNING level so production logs contain
+        # enough information to diagnose model/auth/infra failures without DEBUG.
+        if event.type == SessionEventType.SESSION_ERROR and event.data:
+            error_msg = getattr(event.data, 'message', None) or getattr(event.data, 'content', None) or repr(event.data)
+            logger.warning(f"SESSION_ERROR details: {error_msg}")
         if logger.isEnabledFor(10):  # DEBUG
             data_fields: Dict[str, Any] = {}
             if event.data is not None:
@@ -451,4 +481,360 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
             yield event
     finally:
         unsubscribe()
+
+
+# ---------------------------------------------------------------------------
+# A2A (Agent-to-Agent) Protocol Support
+# ---------------------------------------------------------------------------
+
+def _setup_a2a_routes(self: "CopilotAdapter") -> None:
+    """Add A2A protocol routes to the Starlette app."""
+    from starlette.routing import Route
+    from starlette.responses import JSONResponse
+
+    async def agent_card_handler(request: Request) -> JSONResponse:
+        """Serve the A2A agent card at /.well-known/agent-card.json."""
+        from .a2a_response_converter import build_agent_card
+
+        card = build_agent_card(
+            url=str(request.base_url).rstrip("/"),
+        )
+        return JSONResponse(card)  # build_agent_card returns a dict
+
+    async def message_stream_handler(request: Request) -> Response:
+        """Handle A2A message:stream - streaming task execution with OTEL tracing."""
+        from .a2a_types import Task, TaskState, TaskStatus, Message, Role, TextPart, task_status_event
+        from .a2a_response_converter import A2AResponseConverter
+        import uuid as uuid_mod
+
+        body = await request.json()
+        task_id = body.get("id") or str(uuid_mod.uuid4())
+        context_id = body.get("contextId") or task_id
+        messages = body.get("message", {}).get("parts", [])
+
+        # Extract text from message parts
+        prompt = ""
+        for part in messages:
+            if part.get("type") == "text":
+                prompt = part.get("text", "")
+                break
+
+        if not prompt:
+            return JSONResponse({"error": "No text message provided"}, status_code=400)
+
+        # Create task
+        task = Task(
+            task_id=task_id,
+            context_id=context_id,
+            status=TaskStatus(state=TaskState.WORKING),
+            history=[Message(role=Role.USER, parts=[TextPart(text=prompt)])],
+        )
+        self._a2a_tasks[task_id] = task
+
+        converter = A2AResponseConverter(task_id=task_id, context_id=context_id)
+
+        # Get tracer for OTEL spans
+        tracer = self.tracer or trace.get_tracer(__name__)
+        agent_name = self.get_agent_identifier()
+
+        async def a2a_event_stream() -> AsyncIterator[str]:
+            # Start invoke_agent span (following GenAI semantic conventions)
+            span_attrs = {
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.agent.name": agent_name,
+                "gen_ai.request.model": os.getenv("COPILOT_MODEL", "gpt-5"),
+                "gen_ai.system": "copilot",
+                "a2a.task.id": task_id,
+                "a2a.context.id": context_id,
+            }
+            span = tracer.start_span(
+                name=f"invoke_agent {agent_name}",
+                kind=trace.SpanKind.CLIENT,
+                attributes=span_attrs,
+            )
+            token = otel_context.attach(trace.set_span_in_context(span))
+            tool_spans: Dict[str, Any] = {}  # call_id → (span, token)
+
+            # Emit task working status
+            yield f"data: {json.dumps(task_status_event(task).data)}\n\n"
+
+            try:
+                session = await self._get_or_create_session(task_id)
+                async for event in _iter_copilot_events(session, prompt):
+                    data = event.data
+
+                    # ── Tool execution start: open child span ────────────────
+                    if event.type == SessionEventType.TOOL_EXECUTION_START and data:
+                        call_id = data.tool_call_id or str(uuid_mod.uuid4())
+                        tool_name = data.mcp_tool_name or data.tool_name or "unknown"
+                        tool_attrs = {
+                            "mcp.method.name": "tools/call",
+                            "gen_ai.tool.name": tool_name,
+                            "gen_ai.operation.name": "execute_tool",
+                            "network.transport": "pipe",
+                        }
+                        try:
+                            tool_attrs["mcp.session.id"] = session.session_id
+                        except AttributeError:
+                            pass
+                        if call_id:
+                            tool_attrs["gen_ai.tool.call.id"] = call_id
+                        if data.mcp_server_name:
+                            tool_attrs["mcp.server.name"] = data.mcp_server_name
+                        if data.arguments is not None:
+                            try:
+                                tool_attrs["gen_ai.tool.call.arguments"] = json.dumps(data.arguments)
+                            except Exception:
+                                tool_attrs["gen_ai.tool.call.arguments"] = str(data.arguments)
+                        tool_span = tracer.start_span(
+                            name=f"tools/call {tool_name}",
+                            kind=trace.SpanKind.CLIENT,
+                            attributes=tool_attrs,
+                        )
+                        tool_token = otel_context.attach(trace.set_span_in_context(tool_span))
+                        tool_spans[call_id] = (tool_span, tool_token)
+                        logger.debug(f"A2A tool span started: {tool_name!r} call_id={call_id!r}")
+
+                    # ── Tool execution complete: close child span ────────────
+                    elif event.type == SessionEventType.TOOL_EXECUTION_COMPLETE and data:
+                        call_id = data.tool_call_id
+                        entry = tool_spans.pop(call_id, None) if call_id else None
+                        if entry:
+                            tool_span, tool_token = entry
+                            if data.result is not None:
+                                try:
+                                    result_str = json.dumps(data.result)
+                                except Exception:
+                                    result_str = str(data.result)
+                                tool_span.set_attribute("gen_ai.tool.call.result", result_str[:512])
+                            if hasattr(data, "success") and data.success is False:
+                                tool_span.set_attribute("error.type", "tool_error")
+                            try:
+                                otel_context.detach(tool_token)
+                            except ValueError:
+                                pass
+                            tool_span.end()
+                            logger.debug(f"A2A tool span ended: call_id={call_id!r}")
+
+                    # ── Usage metrics ────────────────────────────────────────
+                    elif event.type == SessionEventType.ASSISTANT_USAGE and data:
+                        if data.model:
+                            span.set_attribute("gen_ai.response.model", data.model)
+                        if data.input_tokens is not None:
+                            span.set_attribute("gen_ai.usage.input_tokens", int(data.input_tokens))
+                        if data.output_tokens is not None:
+                            span.set_attribute("gen_ai.usage.output_tokens", int(data.output_tokens))
+
+                    # Convert and yield A2A events
+                    a2a_events = converter.convert_event(event)
+                    for a2a_event in a2a_events:
+                        yield f"data: {json.dumps(a2a_event.data)}\n\n"
+
+                # Emit final completed status
+                final_text = converter._accumulated_text
+                if final_text:
+                    task.history.append(Message(role=Role.AGENT, parts=[TextPart(text=final_text)]))
+
+                task.status = TaskStatus(state=TaskState.COMPLETED)
+                self._a2a_tasks[task_id] = task
+                span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
+                yield f"data: {json.dumps(task_status_event(task).data)}\n\n"
+
+            except Exception as e:
+                logger.exception(f"A2A stream error: {e}")
+                span.set_attribute("error.type", type(e).__name__)
+                task.status = TaskStatus(state=TaskState.FAILED)
+                self._a2a_tasks[task_id] = task
+                yield f"data: {json.dumps(task_status_event(task).data)}\n\n"
+
+            finally:
+                # Close any uncompleted tool spans
+                for call_id, (tool_span, tool_token) in list(tool_spans.items()):
+                    tool_span.set_attribute("error.type", "stream_aborted")
+                    try:
+                        otel_context.detach(tool_token)
+                    except ValueError:
+                        pass
+                    tool_span.end()
+                try:
+                    otel_context.detach(token)
+                except ValueError:
+                    pass
+                span.end()
+
+        return StreamingResponse(
+            a2a_event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    async def message_send_handler(request: Request) -> JSONResponse:
+        """Handle A2A message:send - non-streaming task execution with OTEL tracing."""
+        from .a2a_types import Task, TaskState, TaskStatus, Message, Role, TextPart
+        from .a2a_response_converter import A2AResponseConverter
+        import uuid as uuid_mod
+
+        body = await request.json()
+        task_id = body.get("id") or str(uuid_mod.uuid4())
+        context_id = body.get("contextId") or task_id
+        messages = body.get("message", {}).get("parts", [])
+
+        # Extract text from message parts
+        prompt = ""
+        for part in messages:
+            if part.get("type") == "text":
+                prompt = part.get("text", "")
+                break
+
+        if not prompt:
+            return JSONResponse({"error": "No text message provided"}, status_code=400)
+
+        # Create task
+        task = Task(
+            task_id=task_id,
+            context_id=context_id,
+            status=TaskStatus(state=TaskState.WORKING),
+            history=[Message(role=Role.USER, parts=[TextPart(text=prompt)])],
+        )
+        self._a2a_tasks[task_id] = task
+
+        converter = A2AResponseConverter(task_id=task_id, context_id=context_id)
+
+        # Get tracer for OTEL spans
+        tracer = self.tracer or trace.get_tracer(__name__)
+        agent_name = self.get_agent_identifier()
+
+        # Start invoke_agent span
+        span_attrs = {
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.agent.name": agent_name,
+            "gen_ai.request.model": os.getenv("COPILOT_MODEL", "gpt-5"),
+            "gen_ai.system": "copilot",
+            "a2a.task.id": task_id,
+            "a2a.context.id": context_id,
+        }
+        span = tracer.start_span(
+            name=f"invoke_agent {agent_name}",
+            kind=trace.SpanKind.CLIENT,
+            attributes=span_attrs,
+        )
+        token = otel_context.attach(trace.set_span_in_context(span))
+        tool_spans: Dict[str, Any] = {}
+
+        try:
+            session = await self._get_or_create_session(task_id)
+            async for event in _iter_copilot_events(session, prompt):
+                data = event.data
+
+                # ── Tool execution start: open child span ────────────────
+                if event.type == SessionEventType.TOOL_EXECUTION_START and data:
+                    call_id = data.tool_call_id or str(uuid_mod.uuid4())
+                    tool_name = data.mcp_tool_name or data.tool_name or "unknown"
+                    tool_attrs = {
+                        "mcp.method.name": "tools/call",
+                        "gen_ai.tool.name": tool_name,
+                        "gen_ai.operation.name": "execute_tool",
+                    }
+                    if call_id:
+                        tool_attrs["gen_ai.tool.call.id"] = call_id
+                    tool_span = tracer.start_span(
+                        name=f"tools/call {tool_name}",
+                        kind=trace.SpanKind.CLIENT,
+                        attributes=tool_attrs,
+                    )
+                    tool_token = otel_context.attach(trace.set_span_in_context(tool_span))
+                    tool_spans[call_id] = (tool_span, tool_token)
+
+                # ── Tool execution complete: close child span ────────────
+                elif event.type == SessionEventType.TOOL_EXECUTION_COMPLETE and data:
+                    call_id = data.tool_call_id
+                    entry = tool_spans.pop(call_id, None) if call_id else None
+                    if entry:
+                        tool_span, tool_token = entry
+                        if data.result is not None:
+                            try:
+                                result_str = json.dumps(data.result)
+                            except Exception:
+                                result_str = str(data.result)
+                            tool_span.set_attribute("gen_ai.tool.call.result", result_str[:512])
+                        try:
+                            otel_context.detach(tool_token)
+                        except ValueError:
+                            pass
+                        tool_span.end()
+
+                # ── Usage metrics ────────────────────────────────────────
+                elif event.type == SessionEventType.ASSISTANT_USAGE and data:
+                    if data.model:
+                        span.set_attribute("gen_ai.response.model", data.model)
+                    if data.input_tokens is not None:
+                        span.set_attribute("gen_ai.usage.input_tokens", int(data.input_tokens))
+                    if data.output_tokens is not None:
+                        span.set_attribute("gen_ai.usage.output_tokens", int(data.output_tokens))
+
+                # Consume converter to accumulate results
+                for _ in converter.convert_event(event):
+                    pass
+
+            # Build final response
+            final_text = converter._accumulated_text
+            if final_text:
+                task.history.append(Message(role=Role.AGENT, parts=[TextPart(text=final_text)]))
+
+            task.status = TaskStatus(state=TaskState.COMPLETED)
+            self._a2a_tasks[task_id] = task
+            span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
+
+            return JSONResponse(task.to_dict())
+
+        except Exception as e:
+            logger.exception(f"A2A send error: {e}")
+            span.set_attribute("error.type", type(e).__name__)
+            task.status = TaskStatus(state=TaskState.FAILED)
+            self._a2a_tasks[task_id] = task
+            return JSONResponse(task.to_dict(), status_code=500)
+
+        finally:
+            # Close uncompleted tool spans
+            for call_id, (tool_span, tool_token) in list(tool_spans.items()):
+                tool_span.set_attribute("error.type", "stream_aborted")
+                try:
+                    otel_context.detach(tool_token)
+                except ValueError:
+                    pass
+                tool_span.end()
+            try:
+                otel_context.detach(token)
+            except ValueError:
+                pass
+            span.end()
+
+    async def task_get_handler(request: Request) -> JSONResponse:
+        """Handle GET /tasks/{id} - retrieve task status."""
+        task_id = request.path_params.get("id")
+        if task_id is None:
+            return JSONResponse({"error": "Task ID required"}, status_code=400)
+        task = self._a2a_tasks.get(task_id)
+        if task is None:
+            return JSONResponse({"error": "Task not found"}, status_code=404)
+        return JSONResponse(task.to_dict())
+
+    # Add A2A routes to the app
+    a2a_routes = [
+        Route("/.well-known/agent-card.json", agent_card_handler, methods=["GET"]),
+        Route("/message:stream", message_stream_handler, methods=["POST"]),
+        Route("/message:send", message_send_handler, methods=["POST"]),
+        Route("/tasks/{id}", task_get_handler, methods=["GET"]),
+    ]
+
+    # Prepend A2A routes to existing routes
+    self.app.routes = a2a_routes + list(self.app.routes)
+    logger.info("A2A protocol endpoints enabled: /.well-known/agent-card.json, /message:stream, /message:send, /tasks/{id}")
+
+
+# Bind the method to the class
+CopilotAdapter._setup_a2a_routes = _setup_a2a_routes
 
