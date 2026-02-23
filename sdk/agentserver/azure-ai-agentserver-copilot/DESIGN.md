@@ -394,6 +394,11 @@ Consider RAPI if:
 The adapter implements the A2A protocol alongside RAPI, enabling clients to
 choose the protocol that best fits their requirements.
 
+> **⚠️ Gateway Limitation**: Azure AI Foundry's hosted agent gateway only
+> forwards `/responses` and `/runs` routes. A2A endpoints are accessible
+> when running locally or with direct container access, but return HTTP 404
+> through the hosted agent gateway.
+
 ### A2A Event Mapping
 
 The A2A converter (`a2a_response_converter.py`) translates Copilot events

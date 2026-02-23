@@ -253,6 +253,20 @@ alongside the standard RAPI (OpenAI Responses API). A2A provides richer
 visibility into agent operations than RAPI, including tool execution status,
 typed artifacts, and task lifecycle events.
 
+> **⚠️ Gateway Limitation (Azure AI Foundry Hosted Agents)**
+>
+> When deployed as an Azure AI Foundry hosted agent, the RAPI gateway **only
+> forwards `/responses` and `/runs` routes** to the container. A2A endpoints
+> (`/.well-known/agent-card.json`, `/message:send`, `/message:stream`,
+> `/tasks/{id}`) return HTTP 404 through the gateway.
+>
+> **A2A endpoints work in these scenarios:**
+> - Running the agent locally (direct `http://localhost:8088`)
+> - Direct container access (port-forwarding, internal networking)
+> - Future gateway updates that add A2A route forwarding
+>
+> For hosted agents, use the RAPI `/responses` endpoint for external access.
+
 ### A2A Endpoints
 
 | Endpoint | Method | Description |

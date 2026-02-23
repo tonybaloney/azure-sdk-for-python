@@ -339,8 +339,12 @@ flowchart TB
 
 ### Endpoint Mapping
 
+> **⚠️ Gateway Limitation**: When deployed as an Azure AI Foundry hosted agent,
+> the RAPI gateway only forwards `/responses` and `/runs` routes. A2A endpoints
+> return HTTP 404 through the gateway and are only accessible when running
+> locally or with direct container access.
+
 | Endpoint | Protocol | Purpose |
-|----------|----------|---------|
 | `POST /responses` | RAPI | OpenAI Responses API (existing) |
 | `POST /runs` | RAPI | Alias for `/responses` |
 | `GET /.well-known/agent-card.json` | A2A | Agent discovery |
