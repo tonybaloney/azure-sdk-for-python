@@ -830,8 +830,9 @@ def _setup_a2a_routes(self: "CopilotAdapter") -> None:
         Route("/tasks/{id}", task_get_handler, methods=["GET"]),
     ]
 
-    # Prepend A2A routes to existing routes
-    self.app.routes = a2a_routes + list(self.app.routes)
+    # Prepend A2A routes to existing routes by modifying router.routes directly
+    for route in reversed(a2a_routes):
+        self.app.router.routes.insert(0, route)
     logger.info("A2A protocol endpoints enabled: /.well-known/agent-card.json, /message:stream, /message:send, /tasks/{id}")
 
 

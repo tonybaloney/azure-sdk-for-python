@@ -426,14 +426,14 @@ Both RAPI and A2A handlers emit OpenTelemetry spans following the
 
 ```mermaid
 stateDiagram-v2
-    [*] --> SUBMITTED: message:send
-    SUBMITTED --> WORKING: Processing starts
-    WORKING --> WORKING: Tool execution / streaming
-    WORKING --> INPUT_REQUIRED: Approval needed
-    INPUT_REQUIRED --> WORKING: User approves
-    INPUT_REQUIRED --> CANCELED: User denies
-    WORKING --> COMPLETED: Final response
-    WORKING --> FAILED: Error
+    [*] --> SUBMITTED : message send
+    SUBMITTED --> WORKING : Processing starts
+    WORKING --> WORKING : Tool execution
+    WORKING --> INPUT_REQUIRED : Approval needed
+    INPUT_REQUIRED --> WORKING : User approves
+    INPUT_REQUIRED --> CANCELED : User denies
+    WORKING --> COMPLETED : Final response
+    WORKING --> FAILED : Error
     COMPLETED --> [*]
     FAILED --> [*]
     CANCELED --> [*]
