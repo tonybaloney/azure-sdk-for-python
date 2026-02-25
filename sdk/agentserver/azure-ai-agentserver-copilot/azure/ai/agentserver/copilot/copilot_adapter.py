@@ -7,7 +7,7 @@ import dataclasses
 import json
 import os
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
@@ -33,6 +33,16 @@ logger = get_logger()
 # does not affect tracing correctness (spans are still started and ended properly).
 import logging as _logging
 _logging.getLogger("opentelemetry.context").setLevel(_logging.CRITICAL)
+
+
+class _HealthCheckFilter(_logging.Filter):
+    """Drop health-check access-log records so they don't pollute App Insights."""
+
+    _PATHS = ("/liveness", "/readiness")
+
+    def filter(self, record: _logging.LogRecord) -> bool:  # noqa: A003
+        msg = record.getMessage()
+        return not any(p in msg for p in self._PATHS)
 
 _COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
 
@@ -115,7 +125,39 @@ class CopilotAdapter(FoundryCBAgent):
         acl: Optional[ToolAcl] = None,
     ):
         super().__init__()
-        self._session_config = session_config or _build_session_config()
+
+        # Register a startup event to suppress health-check noise.
+        # This MUST be a startup event (not inline __init__ code) because
+        # uvicorn's configure_logging() calls dictConfig() which resets
+        # loggers and clears any filters we add before the server starts.
+        # Startup events fire AFTER uvicorn's logging is configured.
+        @self.app.on_event("startup")
+        async def _suppress_health_check_logs():
+            _hc_filter = _HealthCheckFilter()
+            for _name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+                _logging.getLogger(_name).addFilter(_hc_filter)
+
+        # Build default config (handles provider setup from env vars)
+        default_config = _build_session_config()
+
+        if session_config is not None:
+            # Merge user-provided config with default config.
+            # User config takes priority for most fields, but provider
+            # is taken from default if not specified by user.
+            merged = dict(default_config)  # Start with default
+            user_dict = dict(session_config)
+
+            # Merge user settings, but preserve default provider if user didn't set one
+            for key, value in user_dict.items():
+                if value is not None:  # Only override if user provided a value
+                    if key == "provider" and value is None:
+                        continue  # Keep default provider
+                    merged[key] = value
+
+            self._session_config = SessionConfig(**merged)  # type: ignore[arg-type]
+        else:
+            self._session_config = default_config
+
         self._client: Optional[CopilotClient] = None
         self._credential = None
 
@@ -344,6 +386,13 @@ class CopilotAdapter(FoundryCBAgent):
                 # Yield RAPI events immediately — 0..N per Copilot event
                 for rapi_event in converter._convert_event(copilot_event, context):
                     yield rapi_event
+
+            # NOTE: The RAPI gateway/Container App ingress currently drops
+            # the final SSE events (text_done → completed → [DONE]) regardless
+            # of how long the adapter waits before closing.  A sleep here does
+            # NOT help — tested up to 2 seconds with no effect.  The issue is
+            # in the platform infrastructure, not timing.
+
             span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
         except Exception as e:
             span.set_attribute("error.type", type(e).__name__)
@@ -416,6 +465,12 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
             logger.info(f"Copilot event #{event_count:03d}: {event_name} content_len={len(text)}")
         else:
             logger.info(f"Copilot event #{event_count:03d}: {event_name}")
+
+        # Always log SESSION_ERROR details at WARNING level so production logs contain
+        # enough information to diagnose model/auth/infra failures without DEBUG.
+        if event.type == SessionEventType.SESSION_ERROR and event.data:
+            error_msg = getattr(event.data, 'message', None) or getattr(event.data, 'content', None) or repr(event.data)
+            logger.warning(f"SESSION_ERROR details: {error_msg}")
         if logger.isEnabledFor(10):  # DEBUG
             data_fields: Dict[str, Any] = {}
             if event.data is not None:
