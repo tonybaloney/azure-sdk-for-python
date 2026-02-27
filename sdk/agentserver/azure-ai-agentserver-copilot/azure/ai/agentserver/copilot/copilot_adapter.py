@@ -3,11 +3,12 @@
 # ---------------------------------------------------------
 # pylint: disable=logging-fstring-interpolation,broad-exception-caught
 import asyncio
+import collections
 import dataclasses
 import json
 import os
 import uuid
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Optional
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
@@ -147,11 +148,9 @@ class CopilotAdapter(FoundryCBAgent):
             merged = dict(default_config)  # Start with default
             user_dict = dict(session_config)
 
-            # Merge user settings, but preserve default provider if user didn't set one
+            # Merge user settings — only override if user provided a non-None value
             for key, value in user_dict.items():
-                if value is not None:  # Only override if user provided a value
-                    if key == "provider" and value is None:
-                        continue  # Keep default provider
+                if value is not None:
                     merged[key] = value
 
             self._session_config = SessionConfig(**merged)  # type: ignore[arg-type]
@@ -174,8 +173,10 @@ class CopilotAdapter(FoundryCBAgent):
                     "Set TOOL_ACL_PATH to a YAML ACL file for production use."
                 )
 
-        # Multi-turn: map conversation_id → live CopilotSession
-        self._sessions: Dict[str, Any] = {}
+        # Multi-turn: map conversation_id → live CopilotSession (LRU-bounded)
+        _MAX_SESSIONS = int(os.getenv("COPILOT_MAX_SESSIONS", "1000"))
+        self._sessions: collections.OrderedDict[str, Any] = collections.OrderedDict()
+        self._max_sessions = _MAX_SESSIONS
 
         # Keep credential for token refresh when using Foundry with Managed Identity
         if os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL") and not os.getenv("AZURE_AI_FOUNDRY_API_KEY"):
@@ -183,13 +184,19 @@ class CopilotAdapter(FoundryCBAgent):
 
             self._credential = DefaultAzureCredential()
 
-    def _refresh_token_if_needed(self) -> SessionConfig:
-        """Return the session config, refreshing the bearer token if using Foundry."""
+    async def _refresh_token_if_needed(self) -> SessionConfig:
+        """Return the session config, refreshing the bearer token if using Foundry.
+
+        Token acquisition is run in a thread executor to avoid blocking the
+        async event loop during the synchronous HTTP round-trip.
+        """
         if self._credential is None or "provider" not in self._session_config:
             return self._session_config
 
-        token = self._credential.get_token(_COGNITIVE_SERVICES_SCOPE).token
-        self._session_config["provider"]["bearer_token"] = token
+        token = await asyncio.to_thread(
+            self._credential.get_token, _COGNITIVE_SERVICES_SCOPE
+        )
+        self._session_config["provider"]["bearer_token"] = token.token
         return self._session_config
 
     async def _ensure_client(self) -> CopilotClient:
@@ -211,7 +218,7 @@ class CopilotAdapter(FoundryCBAgent):
             logger.debug(f"Attachments: {len(converted_attachments.attachments)} item(s)")
 
         client = await self._ensure_client()
-        config = self._refresh_token_if_needed()
+        config = await self._refresh_token_if_needed()
 
         acl = self._acl
 
@@ -244,8 +251,13 @@ class CopilotAdapter(FoundryCBAgent):
             session = await client.create_session(session_config)
             if conversation_id:
                 self._sessions[conversation_id] = session
+                # Evict oldest session if we've exceeded the cap
+                while len(self._sessions) > self._max_sessions:
+                    evicted_id, _ = self._sessions.popitem(last=False)
+                    logger.debug(f"Evicted oldest session for conversation {evicted_id!r}")
                 logger.debug(f"Cached session {session.session_id!r} under conversation {conversation_id!r}")
         else:
+            self._sessions.move_to_end(conversation_id)
             logger.info(f"Reusing Copilot session {session.session_id!r} for conversation turn (conversation={conversation_id!r})")
 
         tracer = self.tracer or trace.get_tracer(__name__)

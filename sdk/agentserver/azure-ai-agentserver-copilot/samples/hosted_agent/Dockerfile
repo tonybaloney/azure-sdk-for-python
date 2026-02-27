@@ -7,11 +7,14 @@ WORKDIR /app
 
 # Copy the package source and install it
 COPY . package/
-RUN pip install ./package/ azure-identity "github-copilot-sdk>=0.1.25"
+RUN pip install ./package/ azure-identity "github-copilot-sdk==0.1.25"
 
 # Copy the hosted agent entry point and ACL file
 COPY samples/hosted_agent/main.py main.py
 COPY samples/hosted_agent/tools_acl.yaml tools_acl.yaml
+
+RUN useradd -m appuser
+USER appuser
 
 EXPOSE 8088
 

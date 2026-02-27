@@ -119,7 +119,8 @@ class TestFromFile:
         p = tmp_path / "acl.yaml"
         p.write_text('version: "1"\nrules: []\n')
         acl = ToolAcl.from_file(p)
-        assert str(p) in repr(acl)
+        assert "rules=0" in repr(acl)
+        assert acl._source == str(p)
 
 
 # ===========================================================================

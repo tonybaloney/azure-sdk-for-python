@@ -346,19 +346,3 @@ class CopilotStreamingResponseConverter:
             case _:
                 ename = event.type.name if event.type else "UNKNOWN"
                 logger.debug(f"Unhandled Copilot event: {ename}")
-
-    # ------------------------------------------------------------------
-    # Legacy shim kept for any existing call sites
-    # ------------------------------------------------------------------
-
-    def as_response_stream_event(
-        self, event: SessionEvent, context: AgentRunContext,
-    ) -> ResponseStreamEvent | None:
-        """Convert a single event.  Returns the first RAPI event produced, or None.
-
-        .. deprecated::
-            Prefer ``_convert_event`` (a generator) which may yield multiple events.
-        """
-        for e in self._convert_event(event, context):
-            return e
-        return None

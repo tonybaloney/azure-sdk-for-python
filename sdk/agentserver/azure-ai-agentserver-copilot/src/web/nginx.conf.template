@@ -1,0 +1,37 @@
+server {
+    listen 80;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Security headers
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    location /responses {
+        proxy_pass ${API_URL}/responses;
+        proxy_http_version 1.1;
+        proxy_set_header Host $proxy_host;
+        proxy_set_header Connection '';
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 300s;
+        chunked_transfer_encoding on;
+    }
+
+    location /liveness {
+        proxy_pass ${API_URL}/liveness;
+        proxy_http_version 1.1;
+        proxy_set_header Host $proxy_host;
+    }
+
+    location /readiness {
+        proxy_pass ${API_URL}/readiness;
+        proxy_http_version 1.1;
+        proxy_set_header Host $proxy_host;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

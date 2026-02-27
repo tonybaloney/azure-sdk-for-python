@@ -21,7 +21,7 @@ keywords = ["azure", "azure sdk"]
 dependencies = [
     "azure-ai-agentserver-core>=1.0.0b13",
     "azure-identity",
-    "github-copilot-sdk>=0.1.25",
+    "github-copilot-sdk==0.1.25",
     "PyYAML>=6.0",
 ]
 
@@ -55,6 +55,12 @@ fix = false
 [tool.ruff.lint.isort]
 known-first-party = ["azure.ai.agentserver.copilot"]
 combine-as-imports = true
+
+[tool.pytest.ini_options]
+markers = [
+    "unit: Unit tests (no network, no credentials required)",
+    "integration: Integration tests (require GITHUB_TOKEN and live API)",
+]
 
 [tool.azure-sdk-build]
 breaking = false
