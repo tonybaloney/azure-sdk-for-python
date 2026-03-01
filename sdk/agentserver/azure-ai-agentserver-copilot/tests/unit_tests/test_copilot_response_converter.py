@@ -46,7 +46,7 @@ def _make_context(*, with_agent: bool = True, with_conversation: bool = True) ->
     if with_agent:
         payload["agent"] = {"type": "agent_id", "name": "test-agent", "version": "1"}
     if with_conversation:
-        payload["_conversation_id"] = "conv_test123"
+        payload["conversation"] = {"id": "conv_test123"}
     return AgentRunContext(payload)
 
 
@@ -495,6 +495,56 @@ class TestFullEventSequence:
             # SESSION_IDLE produces nothing
         ]
         assert types == expected
+
+
+# ---------------------------------------------------------------------------
+# to_stream_events (batch API)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestToStreamEvents:
+    """Tests for the batch to_stream_events() public method."""
+
+    def test_batch_converts_all_events(self):
+        context = _make_context()
+        converter = CopilotStreamingResponseConverter(context)
+        batch = [
+            _make_event(SessionEventType.ASSISTANT_TURN_START),
+            _make_event(SessionEventType.ASSISTANT_MESSAGE, "Hello!"),
+            _make_event(SessionEventType.ASSISTANT_TURN_END),
+        ]
+        events = list(converter.to_stream_events(batch, context))
+        assert len(events) > 0
+        assert isinstance(events[0], ResponseCreatedEvent)
+
+
+# ---------------------------------------------------------------------------
+# ASSISTANT_REASONING event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestReasoningEvent:
+    """Tests for the ASSISTANT_REASONING event handler."""
+
+    def test_reasoning_event_produces_no_rapi_events(self):
+        context = _make_context()
+        converter = CopilotStreamingResponseConverter(context)
+        events = list(converter._convert_event(
+            _make_event(SessionEventType.ASSISTANT_REASONING, "thinking..."), context
+        ))
+        assert len(events) == 0
+
+    def test_unhandled_event_type_produces_no_rapi_events(self):
+        """Unknown/other event types should produce no RAPI events."""
+        context = _make_context()
+        converter = CopilotStreamingResponseConverter(context)
+        events = list(converter._convert_event(
+            _make_event(SessionEventType.TOOL_EXECUTION_START), context
+        ))
+        assert len(events) == 0
+
 
     def test_streaming_turn_event_types(self):
         """Streaming turn: deltas before done events, completed at end."""

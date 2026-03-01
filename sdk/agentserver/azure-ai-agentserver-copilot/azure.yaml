@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/jongio/azd-app/main/schemas/v1.1/azure.yaml.json
+
+name: azure-ai-agentserver-copilot
+metadata:
+  template: azd-init
+
+hooks:
+  preprovision:
+    windows:
+      shell: pwsh
+      run: node scripts/get-github-token.mjs
+    posix:
+      shell: sh
+      run: node scripts/get-github-token.mjs
+  prerun:
+    windows:
+      shell: pwsh
+      run: node scripts/get-github-token.mjs
+    posix:
+      shell: sh
+      run: node scripts/get-github-token.mjs
+
+services:
+  copilot-agent:
+    project: .
+    language: python
+    host: containerapp
+    command: python samples/hosted_agent/main.py
+    ports: ["8080:8088"]
+    docker:
+      path: ./samples/hosted_agent/Dockerfile
+      context: .
+
+  web:
+    project: ./src/web
+    language: js
+    host: containerapp
+    command: npx vite --port 5173
+    ports: ["5173"]
+    docker:
+      path: ./Dockerfile
+
+reqs:
+  - name: azd
+    minVersion: "1.23.0"
+  - name: git
+    minVersion: "2.0.0"
+  - name: docker
+  - name: python
+  - name: gh
+  - name: node

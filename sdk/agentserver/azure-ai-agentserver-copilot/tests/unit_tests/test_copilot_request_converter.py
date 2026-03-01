@@ -373,3 +373,116 @@ class TestConvertedAttachmentsBool:
     def test_bool_true_when_has_attachments(self):
         ca = ConvertedAttachments(attachments=[{"type": "file", "path": "/tmp/x", "displayName": "x"}])
         assert ca
+
+
+@pytest.mark.unit
+class TestConvertedAttachmentsEdgeCases:
+    """Edge-case tests for attachment materialisation."""
+
+    def test_bad_base64_file_data_produces_no_attachment(self):
+        """Invalid base64 in file_data should be silently skipped."""
+        ca = _make_converter(
+            [{"content": [{"type": "input_file", "filename": "bad.txt", "file_data": "!!!NOT-BASE64!!!"}]}]
+        ).convert_attachments()
+        assert ca.attachments == []
+        ca.cleanup()
+
+    def test_bad_base64_data_uri_produces_no_attachment(self):
+        """Invalid base64 in image data URI should be silently skipped."""
+        ca = _make_converter(
+            [{"content": [{"type": "input_image", "image_url": {"url": "data:image/png;base64,!!!BAD!!!"}}]}]
+        ).convert_attachments()
+        assert ca.attachments == []
+        ca.cleanup()
+
+    def test_image_with_no_image_url_produces_no_attachment(self):
+        """input_image part with missing image_url field should be skipped."""
+        ca = _make_converter(
+            [{"content": [{"type": "input_image"}]}]
+        ).convert_attachments()
+        assert ca.attachments == []
+
+    def test_file_without_filename_uses_default(self):
+        """input_file with file_data but no filename should use 'attachment' as default."""
+        ca = _make_converter(
+            [{"content": [{"type": "input_file", "file_data": _b64("hello")}]}]
+        ).convert_attachments()
+        try:
+            assert len(ca.attachments) == 1
+            assert ca.attachments[0]["displayName"] == "attachment"
+        finally:
+            ca.cleanup()
+
+    def test_dict_input_with_content_key(self):
+        """A single dict input with a 'content' string should work."""
+        cr = _make_converter({"content": "Direct content"})
+        result = cr.convert()
+        assert result == "Direct content"
+
+    def test_content_part_without_type(self):
+        """A content part without 'type' should extract text if present."""
+        cr = _make_converter(
+            [{"content": [{"text": "fallback text"}]}]
+        )
+        result = cr.convert()
+        assert "fallback text" in result
+
+    def test_string_parts_in_content_list(self):
+        """String items in a content list should be extracted as text."""
+        cr = _make_converter(
+            [{"content": ["raw string part", "another"]}]
+        )
+        result = cr.convert()
+        assert "raw string part" in result
+        assert "another" in result
+
+    def test_non_dict_non_string_part_skipped(self):
+        """Non-dict, non-string content parts should be skipped."""
+        cr = _make_converter(
+            [{"content": [42, True, {"type": "input_text", "text": "ok"}]}]
+        )
+        result = cr.convert()
+        assert "ok" in result
+
+    def test_image_url_as_plain_string(self):
+        """image_url can be a plain string URL instead of a dict."""
+        cr = _make_converter(
+            [{"content": [{"type": "input_image", "image_url": "https://example.com/img.png"}]}]
+        )
+        result = cr.convert()
+        assert "[image: https://example.com/img.png]" in result
+
+    def test_content_not_list_or_string_returns_str(self):
+        """Non-list, non-string content falls through to str()."""
+        cr = _make_converter([{"content": 42}])
+        result = cr.convert()
+        assert "42" in result
+
+    def test_input_file_with_file_id_only_annotates_text(self):
+        """input_file with file_id but no file_data annotates prompt text."""
+        cr = _make_converter(
+            [{"content": [{"type": "input_file", "file_id": "file-123", "filename": "data.csv"}]}]
+        )
+        result = cr.convert()
+        assert "[file: data.csv]" in result
+
+    def test_content_list_in_attachments_skips_non_list_content(self):
+        """Non-list content field on a message should be skipped in convert_attachments."""
+        ca = _make_converter(
+            [{"content": "just a string"}]
+        ).convert_attachments()
+        assert ca.attachments == []
+
+    def test_cleanup_handles_already_deleted_file(self):
+        """Cleanup should not raise if temp file already deleted."""
+        ca = ConvertedAttachments(attachments=[], _temp_paths=["/nonexistent/path/12345"])
+        ca.cleanup()  # should not raise
+        assert ca._temp_paths == []
+
+    def test_image_with_file_id_annotates_text(self):
+        """input_image with file_id and no url annotates text."""
+        cr = _make_converter(
+            [{"content": [{"type": "input_image", "image_url": {"url": ""}, "file_id": "img-99"}]}]
+        )
+        result = cr.convert()
+        assert "[image file: img-99]" in result

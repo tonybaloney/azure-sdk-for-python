@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from azure.ai.agentserver.copilot.copilot_adapter import CopilotAdapter, _build_session_config
+
 
 @pytest.mark.unit
 class TestBuildSessionConfig:
@@ -20,8 +22,6 @@ class TestBuildSessionConfig:
             os.environ.pop("AZURE_AI_FOUNDRY_RESOURCE_URL", None)
             os.environ.pop("COPILOT_MODEL", None)
 
-            from azure.ai.agentserver.copilot.copilot_adapter import _build_session_config
-
             config = _build_session_config()
             assert config["model"] == "gpt-5"
             assert "provider" not in config
@@ -30,8 +30,6 @@ class TestBuildSessionConfig:
         """COPILOT_MODEL overrides default when not in BYOK mode."""
         with patch.dict(os.environ, {"COPILOT_MODEL": "gpt-4.1"}, clear=False):
             os.environ.pop("AZURE_AI_FOUNDRY_RESOURCE_URL", None)
-
-            from azure.ai.agentserver.copilot.copilot_adapter import _build_session_config
 
             config = _build_session_config()
             assert config["model"] == "gpt-4.1"
@@ -43,8 +41,6 @@ class TestBuildSessionConfig:
             "COPILOT_MODEL": "gpt-4.1",
         }
         with patch.dict(os.environ, env, clear=False):
-            from azure.ai.agentserver.copilot.copilot_adapter import _build_session_config
-
             config = _build_session_config()
 
         assert config["model"] == "gpt-4.1"
@@ -64,8 +60,6 @@ class TestBuildSessionConfig:
             "AZURE_AI_FOUNDRY_RESOURCE_URL": "https://myresource.openai.azure.com/",
         }
         with patch.dict(os.environ, env, clear=False):
-            from azure.ai.agentserver.copilot.copilot_adapter import _build_session_config
-
             config = _build_session_config()
 
         assert config["provider"]["base_url"] == "https://myresource.openai.azure.com/openai/v1/"
@@ -83,8 +77,6 @@ class TestBuildSessionConfig:
         with patch.dict(os.environ, env, clear=False):
             os.environ.pop("COPILOT_MODEL", None)
 
-            from azure.ai.agentserver.copilot.copilot_adapter import _build_session_config
-
             config = _build_session_config()
 
         assert config["model"] == "gpt-4.1"
@@ -94,10 +86,11 @@ class TestBuildSessionConfig:
 class TestTokenRefresh:
     """Tests for _refresh_token_if_needed()."""
 
-    @patch("azure.ai.agentserver.copilot.copilot_adapter._build_session_config")
-    def test_refresh_updates_bearer_token(self, mock_build):
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_refresh_updates_bearer_token(self):
         """Token refresh replaces the bearer_token in the provider config."""
-        mock_build.return_value = {
+        adapter = CopilotAdapter.__new__(CopilotAdapter)
+        adapter._session_config = {
             "model": "gpt-4.1",
             "provider": {
                 "type": "openai",
@@ -106,31 +99,20 @@ class TestTokenRefresh:
                 "wire_api": "responses",
             },
         }
+        mock_cred = MagicMock()
+        mock_cred.get_token.return_value = MagicMock(token="new-token-456")
+        adapter._credential = mock_cred
 
-        with patch.dict(os.environ, {"AZURE_AI_FOUNDRY_RESOURCE_URL": "https://x.openai.azure.com"}, clear=False):
-            from azure.ai.agentserver.copilot.copilot_adapter import CopilotAdapter
-
-            adapter = CopilotAdapter.__new__(CopilotAdapter)
-            adapter._session_config = mock_build.return_value
-
-            mock_cred = MagicMock()
-            mock_cred.get_token.return_value = MagicMock(token="new-token-456")
-            adapter._credential = mock_cred
-
-            config = adapter._refresh_token_if_needed()
+        config = await adapter._refresh_token_if_needed()
 
         assert config["provider"]["bearer_token"] == "new-token-456"
 
-    @patch("azure.ai.agentserver.copilot.copilot_adapter._build_session_config")
-    def test_no_refresh_without_credential(self, mock_build):
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_no_refresh_without_credential(self):
         """Without a credential (non-BYOK mode), config is returned as-is."""
-        mock_build.return_value = {"model": "gpt-5"}
-
-        from azure.ai.agentserver.copilot.copilot_adapter import CopilotAdapter
-
         adapter = CopilotAdapter.__new__(CopilotAdapter)
-        adapter._session_config = mock_build.return_value
+        adapter._session_config = {"model": "gpt-5"}
         adapter._credential = None
 
-        config = adapter._refresh_token_if_needed()
+        config = await adapter._refresh_token_if_needed()
         assert config == {"model": "gpt-5"}

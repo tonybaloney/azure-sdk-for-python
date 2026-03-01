@@ -19,6 +19,8 @@ from copilot.generated.session_events import SessionEventType
 
 from azure.ai.agentserver.copilot.copilot_adapter import _iter_copilot_events
 
+pytestmark = pytest.mark.asyncio(loop_scope="function")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -84,132 +86,94 @@ class FakeSession:
 @pytest.mark.unit
 class TestIterCopilotEvents:
 
-    def test_yields_events_in_order(self):
+    async def test_yields_events_in_order(self):
         """Events arrive in the same order they are pushed by the session."""
-
-        async def _run():
-            session = FakeSession()
-            session._auto_events = [
-                _make_event(SessionEventType.ASSISTANT_TURN_START),
-                _make_event(SessionEventType.ASSISTANT_MESSAGE, "hello"),
-                _make_event(SessionEventType.ASSISTANT_TURN_END),
-                _make_event(SessionEventType.SESSION_IDLE),
-            ]
-            received = []
-            async for event in _iter_copilot_events(session, "hi"):
-                received.append(event.type)
-            return received
-
-        result = asyncio.run(_run())
-        assert result == [
+        session = FakeSession()
+        session._auto_events = [
+            _make_event(SessionEventType.ASSISTANT_TURN_START),
+            _make_event(SessionEventType.ASSISTANT_MESSAGE, "hello"),
+            _make_event(SessionEventType.ASSISTANT_TURN_END),
+            _make_event(SessionEventType.SESSION_IDLE),
+        ]
+        received = []
+        async for event in _iter_copilot_events(session, "hi"):
+            received.append(event.type)
+        assert received == [
             SessionEventType.ASSISTANT_TURN_START,
             SessionEventType.ASSISTANT_MESSAGE,
             SessionEventType.ASSISTANT_TURN_END,
             SessionEventType.SESSION_IDLE,
         ]
 
-    def test_stops_after_session_idle(self):
+    async def test_stops_after_session_idle(self):
         """Generator closes cleanly after SESSION_IDLE; subsequent events are not yielded."""
-
-        async def _run():
-            session = FakeSession()
-            session._auto_events = [
-                _make_event(SessionEventType.ASSISTANT_TURN_START),
-                _make_event(SessionEventType.SESSION_IDLE),
-                # This arrives after idle — should NOT be yielded
-                _make_event(SessionEventType.ASSISTANT_TURN_END),
-            ]
-            received = []
-            async for event in _iter_copilot_events(session, "hi"):
-                received.append(event.type)
-            return received
-
-        result = asyncio.run(_run())
+        session = FakeSession()
+        session._auto_events = [
+            _make_event(SessionEventType.ASSISTANT_TURN_START),
+            _make_event(SessionEventType.SESSION_IDLE),
+            # This arrives after idle — should NOT be yielded
+            _make_event(SessionEventType.ASSISTANT_TURN_END),
+        ]
+        received = []
+        async for event in _iter_copilot_events(session, "hi"):
+            received.append(event.type)
         # SESSION_IDLE is the last yielded event; ASSISTANT_TURN_END is dropped
-        assert SessionEventType.SESSION_IDLE in result
-        assert SessionEventType.ASSISTANT_TURN_END not in result
+        assert SessionEventType.SESSION_IDLE in received
+        assert SessionEventType.ASSISTANT_TURN_END not in received
 
-    def test_deduplicates_consecutive_identical_events(self):
+    async def test_deduplicates_consecutive_identical_events(self):
         """Consecutive events with the same (type, content) are dropped (resume_session artefact)."""
+        session = FakeSession()
+        e_start = _make_event(SessionEventType.ASSISTANT_TURN_START)
+        session._auto_events = [
+            e_start,
+            e_start,  # duplicate — should be skipped
+            _make_event(SessionEventType.SESSION_IDLE),
+        ]
+        received = []
+        async for event in _iter_copilot_events(session, "hi"):
+            received.append(event.type)
+        assert received.count(SessionEventType.ASSISTANT_TURN_START) == 1
 
-        async def _run():
-            session = FakeSession()
-            e_start = _make_event(SessionEventType.ASSISTANT_TURN_START)
-            session._auto_events = [
-                e_start,
-                e_start,  # duplicate — should be skipped
-                _make_event(SessionEventType.SESSION_IDLE),
-            ]
-            received = []
-            async for event in _iter_copilot_events(session, "hi"):
-                received.append(event.type)
-            return received
-
-        result = asyncio.run(_run())
-        assert result.count(SessionEventType.ASSISTANT_TURN_START) == 1
-
-    def test_unsubscribes_listener_on_completion(self):
+    async def test_unsubscribes_listener_on_completion(self):
         """The session listener is unsubscribed once the generator is exhausted."""
+        session = FakeSession()
+        session._auto_events = [_make_event(SessionEventType.SESSION_IDLE)]
+        async for _ in _iter_copilot_events(session, "hi"):
+            pass
+        assert len(session._callbacks) == 0, "Listener should have been unsubscribed after iteration"
 
-        async def _run():
-            session = FakeSession()
-            session._auto_events = [_make_event(SessionEventType.SESSION_IDLE)]
-            async for _ in _iter_copilot_events(session, "hi"):
-                pass
-            return len(session._callbacks)
-
-        remaining = asyncio.run(_run())
-        assert remaining == 0, "Listener should have been unsubscribed after iteration"
-
-    def test_unsubscribes_on_early_break(self):
+    async def test_unsubscribes_on_early_break(self):
         """The listener is unsubscribed when the generator is explicitly closed (aclosing pattern)."""
+        session = FakeSession()
+        session._auto_events = [
+            _make_event(SessionEventType.ASSISTANT_TURN_START),
+            _make_event(SessionEventType.ASSISTANT_MESSAGE, "x"),
+            _make_event(SessionEventType.SESSION_IDLE),
+        ]
+        # aclosing() calls aclose() on exit, which triggers the finally block
+        # immediately — the correct pattern when abandoning an async generator early.
+        async with aclosing(_iter_copilot_events(session, "hi")) as gen:
+            async for event in gen:
+                if event.type == SessionEventType.ASSISTANT_TURN_START:
+                    break  # abandon iteration early
+        assert len(session._callbacks) == 0
 
-        async def _run():
-            session = FakeSession()
-            session._auto_events = [
-                _make_event(SessionEventType.ASSISTANT_TURN_START),
-                _make_event(SessionEventType.ASSISTANT_MESSAGE, "x"),
-                _make_event(SessionEventType.SESSION_IDLE),
-            ]
-            # aclosing() calls aclose() on exit, which triggers the finally block
-            # immediately — the correct pattern when abandoning an async generator early.
-            async with aclosing(_iter_copilot_events(session, "hi")) as gen:
-                async for event in gen:
-                    if event.type == SessionEventType.ASSISTANT_TURN_START:
-                        break  # abandon iteration early
-            return len(session._callbacks)
-
-        remaining = asyncio.run(_run())
-        assert remaining == 0
-
-    def test_records_sent_prompt(self):
+    async def test_records_sent_prompt(self):
         """The prompt is forwarded to ``session.send``."""
-
-        async def _run():
-            session = FakeSession()
-            session._auto_events = [_make_event(SessionEventType.SESSION_IDLE)]
-            async for _ in _iter_copilot_events(session, "What is 2+2?"):
-                pass
-            return session._sent_prompts
-
-        prompts = asyncio.run(_run())
+        session = FakeSession()
+        session._auto_events = [_make_event(SessionEventType.SESSION_IDLE)]
+        async for _ in _iter_copilot_events(session, "What is 2+2?"):
+            pass
         # The prompt string is inside a MessageOptions object; we check send was called with something
-        assert len(prompts) == 1
+        assert len(session._sent_prompts) == 1
 
-    def test_timeout_raises(self):
+    async def test_timeout_raises(self):
         """If no SESSION_IDLE arrives within the timeout, TimeoutError is raised."""
-
-        async def _run():
-            session = FakeSession()
-            # Never push SESSION_IDLE — session just hangs
-            session._auto_events = []
-            received = []
-            try:
-                async for event in _iter_copilot_events(session, "hi", timeout=0.05):
-                    received.append(event.type)
-            except asyncio.TimeoutError:
-                return "timeout"
-            return "no_timeout"
-
-        result = asyncio.run(_run())
-        assert result == "timeout"
+        session = FakeSession()
+        # Never push SESSION_IDLE — session just hangs
+        session._auto_events = []
+        received = []
+        with pytest.raises(asyncio.TimeoutError):
+            async for event in _iter_copilot_events(session, "hi", timeout=0.05):
+                received.append(event.type)

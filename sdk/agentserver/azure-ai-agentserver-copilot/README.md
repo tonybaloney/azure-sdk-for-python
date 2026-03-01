@@ -20,6 +20,38 @@ pip install azure-ai-agentserver-copilot
 * [GitHub Copilot CLI](https://github.com/github/copilot-sdk) installed and in `$PATH`
 * Valid GitHub Copilot authentication (`gh auth login`)
 
+### Install azd app (Local Development)
+
+[azd app](https://github.com/jongio/azd-app) lets you run all project services
+locally with a single command, with auto-dependencies, a real-time dashboard,
+and AI-powered debugging via MCP.
+
+1. **Install the Azure Developer CLI** (if not already installed):
+
+   ```bash
+   # Windows
+   winget install microsoft.azd
+
+   # macOS
+   brew tap azure/azd && brew install azd
+
+   # Linux
+   curl -fsSL https://aka.ms/install-azd.sh | bash
+   ```
+
+2. **Add the extension source and install azd app**:
+
+   ```bash
+   azd extension source add -n jongio -t url -l https://jongio.github.io/azd-extensions/registry.json
+   azd extension install jongio.azd.app
+   ```
+
+3. **Run the project**:
+
+   ```bash
+   azd app run
+   ```
+
 ### Usage
 
 ```python

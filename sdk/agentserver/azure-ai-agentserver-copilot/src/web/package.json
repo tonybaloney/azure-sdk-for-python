@@ -1,0 +1,25 @@
+{
+  "name": "agentserver-copilot-web",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Chat UI for the Copilot Agent Server",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.13",
+    "@types/react-dom": "^19.2.3",
+    "@types/react-syntax-highlighter": "^15.5.13",
+    "@vitejs/plugin-react": "^5.1.4",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  },
+  "dependencies": {
+    "react-markdown": "^10.1.0",
+    "react-syntax-highlighter": "^16.1.0"
+  }
+}
