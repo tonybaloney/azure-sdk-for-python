@@ -1,18 +1,20 @@
 # ---------------------------------------------------------
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # ---------------------------------------------------------
-# pylint: disable=logging-fstring-interpolation,broad-exception-caught
+# pylint: disable=broad-exception-caught
 import asyncio
 import collections
 import dataclasses
+import logging
 import json
 import os
+import urllib.parse
 import uuid
 from typing import Any, Dict, Optional
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
-from copilot.types import PermissionRequest, PermissionRequestResult, ResumeSessionConfig
+from copilot.types import PermissionRequest, PermissionRequestResult
 from opentelemetry import context as otel_context, trace
 
 from azure.ai.agentserver.core.constants import Constants
@@ -20,33 +22,26 @@ from azure.ai.agentserver.core.logger import get_logger
 from azure.ai.agentserver.core.server.base import FoundryCBAgent
 from azure.ai.agentserver.core.server.common.agent_run_context import AgentRunContext
 
+from azure.identity import DefaultAzureCredential
+
 from .models.copilot_request_converter import ConvertedAttachments, CopilotRequestConverter
 from .models.copilot_response_converter import CopilotResponseConverter, CopilotStreamingResponseConverter
 from .tool_acl import ToolAcl
 
 
-
 logger = get_logger()
 
-# The opentelemetry.context.detach() call can emit "Failed to detach context" warnings
-# when an async generator's finally block runs in a different contextvars context than
-# where the token was created.  This is expected behaviour in async streaming code and
-# does not affect tracing correctness (spans are still started and ended properly).
-import logging as _logging
-_logging.getLogger("opentelemetry.context").setLevel(_logging.CRITICAL)
 
+class _HealthCheckFilter(logging.Filter):
+    """Drop health-check access-log records so they don't pollute logs."""
 
-class _HealthCheckFilter(_logging.Filter):
-    """Drop health-check access-log records so they don't pollute App Insights."""
-
-    _PATHS = ("/liveness", "/readiness")
-
-    def filter(self, record: _logging.LogRecord) -> bool:  # noqa: A003
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
         msg = record.getMessage()
-        return not any(p in msg for p in self._PATHS)
+        return not any(p in msg for p in ("/liveness", "/readiness"))
 
 _COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
 
+DEFAULT_MODEL = "gpt-4.1"  # Lowest-cost default, but should be user specified in most cases.
 
 def _build_session_config() -> SessionConfig:
     """Build a SessionConfig from environment variables.
@@ -54,58 +49,71 @@ def _build_session_config() -> SessionConfig:
     When ``AZURE_AI_FOUNDRY_RESOURCE_URL`` is set the adapter runs in
     **BYOK mode** against Azure AI Foundry.
 
-    Authentication priority:
+    Authentication priority when AZURE_AI_FOUNDRY_RESOURCE_URL is set:
     1. ``AZURE_AI_FOUNDRY_API_KEY`` — static API key (easiest for local dev)
     2. ``DefaultAzureCredential`` — Managed Identity / Azure CLI (for prod)
 
-    When using an API key the token is set once at startup.  When using
-    ``DefaultAzureCredential`` the bearer token starts as a placeholder and
-    is refreshed lazily by ``_refresh_token_if_needed()`` before each
-    session.
+    Otherwise, the adapter falls back to the default GitHub Copilot models which use
+    GitHub authentication (e.g. via GITHUB_TOKEN env var or GitHub CLI) and
+    don't require a provider config.
 
     Environment variables
     ---------------------
-    AZURE_AI_FOUNDRY_RESOURCE_URL
-        The Azure AI Foundry resource URL, e.g.
-        ``https://<resource>.cognitiveservices.azure.com``.
-    AZURE_AI_FOUNDRY_API_KEY
+    AZURE_AI_FOUNDRY_RESOURCE_URL (optional)
+        The Microsoft Foundry resource URL, e.g.
+        ``https://<project name>.openai.azure.com/``.
+        This is the base URL, not the full CAPI/RAPI URL.
+    AZURE_AI_FOUNDRY_API_KEY (optional)
         Static API key for the Foundry resource.  If set, takes priority
         over ``DefaultAzureCredential``.
-    COPILOT_MODEL
+    GITHUB_TOKEN (optional)
+        GitHub PAT token for authentication (optional).
+    COPILOT_MODEL (optional)
         Model deployment name (default ``gpt-4.1``).
     """
     foundry_url = os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL")
-    model = os.getenv("COPILOT_MODEL", "gpt-4.1")
+    model = os.getenv("COPILOT_MODEL", DEFAULT_MODEL)  # gpt-4.1 is 0x
 
     if foundry_url:
-        base_url = foundry_url.rstrip("/") + "/openai/v1/"
+        # Validate the URL conforms to either of https://domain/openai/v1/ or https://domain/ 
+        # and normalize to https://domain/openai/v1/ if needed.
+        parsed = urllib.parse.urlparse(foundry_url)
+        if not parsed.path.endswith("/openai/v1/"):
+            if parsed.path != "/" and parsed.path != "":
+                logger.warning(
+                    "AZURE_AI_FOUNDRY_RESOURCE_URL path should end with /openai/v1/ or be empty. Not %s."
+                    "Normalizing URL by appending /openai/v1/ to the path.",
+                    foundry_url,
+                )
+            foundry_url = urllib.parse.urljoin(foundry_url, "/openai/v1/")
         api_key = os.getenv("AZURE_AI_FOUNDRY_API_KEY")
 
         if api_key:
-            logger.info(f"BYOK mode (API key): {base_url}")
+            logger.info("Using API auth with FOUNDRY URL: %s", foundry_url)
             return SessionConfig(
                 model=model,
                 provider=ProviderConfig(
                     type="openai",
-                    base_url=base_url,
+                    base_url=foundry_url,
                     bearer_token=api_key,
                     wire_api="responses",
                 ),
             )
 
-        logger.info(f"BYOK mode (Managed Identity): {base_url}")
+        logger.info("Using Managed Identity auth with FOUNDRY URL: %s", foundry_url)
         return SessionConfig(
             model=model,
             provider=ProviderConfig(
                 type="openai",
-                base_url=base_url,
+                base_url=foundry_url,
                 bearer_token="placeholder",  # refreshed before first use
                 wire_api="responses",
             ),
         )
 
     # Fallback: default GitHub Copilot models
-    return SessionConfig(model=os.getenv("COPILOT_MODEL", "gpt-5"))
+    logger.info("No FOUNDRY URL configured, using default Copilot provider with model %r", model)
+    return SessionConfig(model=model)
 
 
 class CopilotAdapter(FoundryCBAgent):
@@ -136,7 +144,7 @@ class CopilotAdapter(FoundryCBAgent):
         async def _suppress_health_check_logs():
             _hc_filter = _HealthCheckFilter()
             for _name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
-                _logging.getLogger(_name).addFilter(_hc_filter)
+                logging.getLogger(_name).addFilter(_hc_filter)
 
         # Build default config (handles provider setup from env vars)
         default_config = _build_session_config()
@@ -180,8 +188,6 @@ class CopilotAdapter(FoundryCBAgent):
 
         # Keep credential for token refresh when using Foundry with Managed Identity
         if os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL") and not os.getenv("AZURE_AI_FOUNDRY_API_KEY"):
-            from azure.identity import DefaultAzureCredential
-
             self._credential = DefaultAzureCredential()
 
     async def _refresh_token_if_needed(self) -> SessionConfig:
@@ -247,6 +253,7 @@ class CopilotAdapter(FoundryCBAgent):
                 f"Creating new Copilot session"
                 + (f" for conversation {conversation_id!r}" if conversation_id else "")
             )
+            # TODO: on_user_input_request needs a callback
             session_config = SessionConfig(**config, on_permission_request=_on_permission)
             session = await client.create_session(session_config)
             if conversation_id:
