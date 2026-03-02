@@ -15,7 +15,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional, Union
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
 from copilot.types import PermissionRequest, PermissionRequestResult
-from opentelemetry import context as otel_context, trace
+from opentelemetry import trace
 
 from azure.ai.agentserver.core.constants import Constants
 from azure.ai.agentserver.core.logger import get_logger
@@ -255,20 +255,6 @@ class CopilotAdapter(FoundryCBAgent):
             self._sessions.move_to_end(conversation_id)
             logger.info(f"Reusing Copilot session {session.session_id!r} for conversation turn (conversation={conversation_id!r})")
 
-        tracer = self.tracer or trace.get_tracer(__name__)
-        agent_name = self.get_agent_identifier()
-        request_model = config.get("model", "") if hasattr(config, "get") else ""
-
-        span_attrs: Dict[str, Any] = {
-            "gen_ai.operation.name": "invoke_agent",
-            "gen_ai.provider.name": "github.copilot",
-            "gen_ai.agent.id": "copilot",
-            "gen_ai.agent.name": agent_name,
-            "gen_ai.request.model": request_model,
-        }
-        if conversation_id:
-            span_attrs["gen_ai.conversation.id"] = conversation_id
-
         if not context.stream:
             # Non-streaming: collect all events and extract the final text
             # from the authoritative ASSISTANT_MESSAGE event.
@@ -283,7 +269,22 @@ class CopilotAdapter(FoundryCBAgent):
 
         # Streaming: return an async generator so events flow to the client
         # immediately as the Copilot SDK emits them — no wait-until-idle.
-        return self._run_streaming(session, prompt, converted_attachments, context, tracer, span_attrs)
+        return self._run_streaming(session, prompt, converted_attachments, context, config)
+
+    def _build_invoke_span_attrs(self, config, conversation_id: Optional[str] = None) -> Dict[str, Any]:
+        """Build OpenTelemetry span attributes for an ``invoke_agent`` span."""
+        agent_name = self.get_agent_identifier()
+        request_model = config.get("model", "") if hasattr(config, "get") else ""
+        attrs: Dict[str, Any] = {
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.provider.name": "github.copilot",
+            "gen_ai.agent.id": "copilot",
+            "gen_ai.agent.name": agent_name,
+            "gen_ai.request.model": request_model,
+        }
+        if conversation_id:
+            attrs["gen_ai.conversation.id"] = conversation_id
+        return attrs
 
     async def _run_streaming(
         self,
@@ -291,135 +292,124 @@ class CopilotAdapter(FoundryCBAgent):
         prompt: str,
         converted_attachments: ConvertedAttachments,
         context: AgentRunContext,
-        tracer: Any,
-        span_attrs: Dict[str, Any],
+        config: Any,
     ):
         """Async generator: converts Copilot events → RAPI stream events on-the-fly.
 
-        The OTel ``invoke_agent`` span is started before the first event and
-        closed in the ``finally`` block so its duration covers the full stream.
-        Usage attributes (token counts, response model) are set as soon as the
-        ``ASSISTANT_USAGE`` event arrives, before the span ends.
+        Uses the base class's ``self.tracer`` (set up by ``init_tracing()``) to
+        create an ``invoke_agent`` span covering the full stream.  The
+        ``start_as_current_span`` context manager handles span lifecycle,
+        context propagation, and exception recording automatically.
+
+        Usage attributes (token counts, response model) are enriched as
+        ``ASSISTANT_USAGE`` events arrive.
 
         Per-tool ``execute_tool`` child spans are opened on
         ``TOOL_EXECUTION_START`` and closed on ``TOOL_EXECUTION_COMPLETE``.
-        They inherit the trace context from the enclosing ``invoke_agent`` span.
+        They automatically inherit the ``invoke_agent`` span as parent
+        via the current trace context.
         """
+        span_attrs = self._build_invoke_span_attrs(config, context.conversation_id)
         agent_name = span_attrs.get("gen_ai.agent.name", "")
-        span = tracer.start_span(
+        # tool_call_id → child Span for in-flight tool executions
+        tool_spans: Dict[str, Any] = {}
+
+        with self.tracer.start_as_current_span(
             name=f"invoke_agent {agent_name}",
             kind=trace.SpanKind.CLIENT,
             attributes=span_attrs,
-        )
-        token = otel_context.attach(trace.set_span_in_context(span))
-        # tool_call_id → (child_span, otel_token) for in-flight tool executions
-        tool_spans: Dict[str, Any] = {}
-        try:
-            converter = CopilotStreamingResponseConverter(context)
-            async for copilot_event in _iter_copilot_events(session, prompt, attachments=converted_attachments.attachments):
-                data = copilot_event.data
-
-                # ── Tool execution start: open a child span ────────────────────
-                # Span follows OTel MCP semconv (tools/call):
-                # https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/
-                if copilot_event.type == SessionEventType.TOOL_EXECUTION_START and data:
-                    call_id = data.tool_call_id or str(uuid.uuid4())
-                    tool_name = data.mcp_tool_name or data.tool_name or "unknown"
-                    tool_attrs: Dict[str, Any] = {
-                        # Required by MCP semconv
-                        "mcp.method.name": "tools/call",
-                        # Conditionally required when tool is present
-                        "gen_ai.tool.name": tool_name,
-                        # Recommended
-                        "gen_ai.operation.name": "execute_tool",
-                        "network.transport": "pipe",  # Copilot SDK uses stdio
-                    }
-                    # mcp.session.id — recommended when part of a session
-                    try:
-                        tool_attrs["mcp.session.id"] = session.session_id
-                    except AttributeError:
-                        pass
-                    if call_id:
-                        tool_attrs["gen_ai.tool.call.id"] = call_id
-                    if data.mcp_server_name:
-                        tool_attrs["mcp.server.name"] = data.mcp_server_name
-                    # gen_ai.tool.call.arguments — opt-in per MCP semconv
-                    if data.arguments is not None:
-                        try:
-                            tool_attrs["gen_ai.tool.call.arguments"] = json.dumps(data.arguments)
-                        except Exception:
-                            tool_attrs["gen_ai.tool.call.arguments"] = str(data.arguments)
-                    tool_span = tracer.start_span(
-                        name=f"tools/call {tool_name}",
-                        kind=trace.SpanKind.CLIENT,
-                        attributes=tool_attrs,
-                    )
-                    tool_token = otel_context.attach(trace.set_span_in_context(tool_span))
-                    tool_spans[call_id] = (tool_span, tool_token)
-                    logger.debug(f"Tool span started: {tool_name!r} call_id={call_id!r}")
-
-                # ── Tool execution complete: close the matching child span ──────
-                elif copilot_event.type == SessionEventType.TOOL_EXECUTION_COMPLETE and data:
-                    call_id = data.tool_call_id
-                    entry = tool_spans.pop(call_id, None) if call_id else None
-                    if entry:
-                        tool_span, tool_token = entry
-                        # gen_ai.tool.call.result — opt-in per MCP semconv
-                        if data.result is not None:
-                            try:
-                                result_str = json.dumps(data.result)
-                            except Exception:
-                                result_str = str(data.result)
-                            tool_span.set_attribute("gen_ai.tool.call.result", result_str[:512])
-                        # error.type — required when tool execution failed
-                        if hasattr(data, "success") and data.success is False:
-                            tool_span.set_attribute("error.type", "tool_error")
-                        try:
-                            otel_context.detach(tool_token)
-                        except ValueError:
-                            pass  # token created in a different async context — safe to ignore
-                        tool_span.end()
-                        logger.debug(f"Tool span ended: call_id={call_id!r}")
-
-                # ── Enrich parent span from usage event ───────────────────────
-                elif copilot_event.type == SessionEventType.ASSISTANT_USAGE and data:
-                    if data.model:
-                        span.set_attribute("gen_ai.response.model", data.model)
-                    if data.input_tokens is not None:
-                        span.set_attribute("gen_ai.usage.input_tokens", int(data.input_tokens))
-                    if data.output_tokens is not None:
-                        span.set_attribute("gen_ai.usage.output_tokens", int(data.output_tokens))
-
-                # Yield RAPI events immediately — 0..N per Copilot event
-                for rapi_event in converter._convert_event(copilot_event, context):
-                    yield rapi_event
-
-            # NOTE: The RAPI gateway/Container App ingress currently drops
-            # the final SSE events (text_done → completed → [DONE]) regardless
-            # of how long the adapter waits before closing.  A sleep here does
-            # NOT help — tested up to 2 seconds with no effect.  The issue is
-            # in the platform infrastructure, not timing.
-
-            span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
-        except Exception as e:
-            span.set_attribute("error.type", type(e).__name__)
-            logger.error(f"Error during Copilot streaming: {e}")
-            raise
-        finally:
-            # Close any tool spans that were never completed (e.g. stream aborted)
-            for call_id, (tool_span, tool_token) in list(tool_spans.items()):
-                tool_span.set_attribute("error.type", "stream_aborted")
-                try:
-                    otel_context.detach(tool_token)
-                except ValueError:
-                    pass  # token created in a different async context — safe to ignore
-                tool_span.end()
+        ) as span:
             try:
-                otel_context.detach(token)
-            except ValueError:
-                pass  # token created in a different async context — safe to ignore
-            span.end()
-            converted_attachments.cleanup()
+                converter = CopilotStreamingResponseConverter(context)
+                async for copilot_event in _iter_copilot_events(session, prompt, attachments=converted_attachments.attachments):
+                    data = copilot_event.data
+
+                    # ── Tool execution start: open a child span ────────────────────
+                    # Span follows OTel MCP semconv (tools/call):
+                    # https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/
+                    # Child spans inherit the invoke_agent parent automatically.
+                    if copilot_event.type == SessionEventType.TOOL_EXECUTION_START and data:
+                        call_id = data.tool_call_id or str(uuid.uuid4())
+                        tool_name = data.mcp_tool_name or data.tool_name or "unknown"
+                        tool_attrs: Dict[str, Any] = {
+                            # Required by MCP semconv
+                            "mcp.method.name": "tools/call",
+                            # Conditionally required when tool is present
+                            "gen_ai.tool.name": tool_name,
+                            # Recommended
+                            "gen_ai.operation.name": "execute_tool",
+                            "network.transport": "pipe",  # Copilot SDK uses stdio
+                        }
+                        # mcp.session.id — recommended when part of a session
+                        try:
+                            tool_attrs["mcp.session.id"] = session.session_id
+                        except AttributeError:
+                            pass
+                        if call_id:
+                            tool_attrs["gen_ai.tool.call.id"] = call_id
+                        if data.mcp_server_name:
+                            tool_attrs["mcp.server.name"] = data.mcp_server_name
+                        # gen_ai.tool.call.arguments — opt-in per MCP semconv
+                        if data.arguments is not None:
+                            try:
+                                tool_attrs["gen_ai.tool.call.arguments"] = json.dumps(data.arguments)
+                            except Exception:
+                                tool_attrs["gen_ai.tool.call.arguments"] = str(data.arguments)
+                        tool_spans[call_id] = self.tracer.start_span(
+                            name=f"tools/call {tool_name}",
+                            kind=trace.SpanKind.CLIENT,
+                            attributes=tool_attrs,
+                        )
+                        logger.debug(f"Tool span started: {tool_name!r} call_id={call_id!r}")
+
+                    # ── Tool execution complete: close the matching child span ──────
+                    elif copilot_event.type == SessionEventType.TOOL_EXECUTION_COMPLETE and data:
+                        call_id = data.tool_call_id
+                        tool_span = tool_spans.pop(call_id, None) if call_id else None
+                        if tool_span:
+                            # gen_ai.tool.call.result — opt-in per MCP semconv
+                            if data.result is not None:
+                                try:
+                                    result_str = json.dumps(data.result)
+                                except Exception:
+                                    result_str = str(data.result)
+                                tool_span.set_attribute("gen_ai.tool.call.result", result_str[:512])
+                            # error.type — required when tool execution failed
+                            if hasattr(data, "success") and data.success is False:
+                                tool_span.set_attribute("error.type", "tool_error")
+                            tool_span.end()
+                            logger.debug(f"Tool span ended: call_id={call_id!r}")
+
+                    # ── Enrich parent span from usage event ───────────────────────
+                    elif copilot_event.type == SessionEventType.ASSISTANT_USAGE and data:
+                        if data.model:
+                            span.set_attribute("gen_ai.response.model", data.model)
+                        if data.input_tokens is not None:
+                            span.set_attribute("gen_ai.usage.input_tokens", int(data.input_tokens))
+                        if data.output_tokens is not None:
+                            span.set_attribute("gen_ai.usage.output_tokens", int(data.output_tokens))
+
+                    # Yield RAPI events immediately — 0..N per Copilot event
+                    for rapi_event in converter._convert_event(copilot_event, context):
+                        yield rapi_event
+
+                # NOTE: The RAPI gateway/Container App ingress currently drops
+                # the final SSE events (text_done → completed → [DONE]) regardless
+                # of how long the adapter waits before closing.  A sleep here does
+                # NOT help — tested up to 2 seconds with no effect.  The issue is
+                # in the platform infrastructure, not timing.
+
+                span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
+            except Exception as e:
+                span.set_attribute("error.type", type(e).__name__)
+                logger.error(f"Error during Copilot streaming: {e}")
+                raise
+            finally:
+                # Close any tool spans that were never completed (e.g. stream aborted)
+                for _call_id, tool_span in list(tool_spans.items()):
+                    tool_span.set_attribute("error.type", "stream_aborted")
+                    tool_span.end()
+                converted_attachments.cleanup()
 
     def get_trace_attributes(self):
         attrs = super().get_trace_attributes()
