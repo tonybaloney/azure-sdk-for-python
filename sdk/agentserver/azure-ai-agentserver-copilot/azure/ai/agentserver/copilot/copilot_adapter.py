@@ -177,6 +177,7 @@ class CopilotAdapter(FoundryCBAgent):
             self._session_config = default_config
 
         self._client: Optional[CopilotClient] = None
+        self._client_lock = asyncio.Lock()
         self._credential = None
 
         # Permission handler function is one of (in order of precedence):
@@ -204,6 +205,11 @@ class CopilotAdapter(FoundryCBAgent):
         if os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL") and not os.getenv("AZURE_AI_FOUNDRY_API_KEY"):
             self._credential = DefaultAzureCredential()
 
+        # Register Starlette shutdown hook to stop the Copilot CLI process.
+        @self.app.on_event("shutdown")
+        async def _on_shutdown():
+            await self._stop_client()
+
     async def _refresh_token_if_needed(self) -> SessionConfig:
         """Return the session config, refreshing the bearer token if using Foundry.
 
@@ -219,6 +225,40 @@ class CopilotAdapter(FoundryCBAgent):
         self._session_config["provider"]["bearer_token"] = token.token
         return self._session_config
 
+    async def _ensure_client_started(self) -> CopilotClient:
+        """Return the shared CopilotClient, starting it on first use.
+
+        The client is created once and reused for the lifetime of the server.
+        A ``shutdown`` event hook (registered in ``__init__``) calls ``stop()``
+        when the Starlette app shuts down.
+        """
+        if self._client is not None:
+            return self._client
+        async with self._client_lock:
+            # Double-check after acquiring the lock.
+            if self._client is not None:
+                return self._client
+            client = CopilotClient()
+            await client.start()
+            self._client = client
+            logger.info("CopilotClient started")
+            return client
+
+    async def _stop_client(self) -> None:
+        """Gracefully stop the CopilotClient and its CLI subprocess."""
+        client = self._client
+        if client is None:
+            return
+        self._client = None
+        try:
+            errors = await client.stop()
+            if errors:
+                for err in errors:
+                    logger.warning("CopilotClient stop error: %s", err.message)
+            logger.info("CopilotClient stopped")
+        except Exception:
+            logger.exception("Error stopping CopilotClient")
+
     async def agent_run(self, context: AgentRunContext):
 
         req_converter = CopilotRequestConverter(context.request)
@@ -228,9 +268,7 @@ class CopilotAdapter(FoundryCBAgent):
         if converted_attachments:
             logger.debug(f"Attachments: {len(converted_attachments.attachments)} item(s)")
 
-        self._client = CopilotClient()
-        await self._client.start()
-
+        client = await self._ensure_client_started()
         config = await self._refresh_token_if_needed()
 
         conversation_id = context.conversation_id
@@ -243,7 +281,7 @@ class CopilotAdapter(FoundryCBAgent):
             )
             # TODO: on_user_input_request needs a callback
             session_config = SessionConfig(**config, on_permission_request=self._on_permission_fn)
-            session = await self._client.create_session(session_config)
+            session = await client.create_session(session_config)
             if conversation_id:
                 self._sessions[conversation_id] = session
                 # Evict oldest session if we've exceeded the cap
