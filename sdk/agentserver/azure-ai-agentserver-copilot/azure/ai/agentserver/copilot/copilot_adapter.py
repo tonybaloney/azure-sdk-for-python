@@ -11,7 +11,7 @@ import urllib.parse
 import uuid
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
-from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
+from copilot import CopilotClient, MessageOptions, PermissionHandler, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
 from copilot.types import PermissionRequest, PermissionRequestResult
 from opentelemetry import trace
@@ -201,6 +201,11 @@ class CopilotAdapter(FoundryCBAgent):
         if self._on_permission_fn is None:
             self._on_permission_fn = on_permission_request
 
+        # The SDK requires on_permission_request on every session.
+        # Fall back to the built-in approve-all handler when nothing is configured.
+        if self._on_permission_fn is None:
+            self._on_permission_fn = PermissionHandler.approve_all
+
         # Multi-turn: map conversation_id → live CopilotSession (LRU-bounded)
         _MAX_SESSIONS = int(os.getenv("COPILOT_MAX_SESSIONS", "1000"))
         self._sessions: collections.OrderedDict[str, Any] = collections.OrderedDict()
@@ -254,11 +259,11 @@ class CopilotAdapter(FoundryCBAgent):
             return
         self._client = None
         try:
-            errors = await client.stop()
-            if errors:
-                for err in errors:
-                    logger.warning("CopilotClient stop error: %s", err.message)
+            await client.stop()
             logger.info("CopilotClient stopped")
+        except ExceptionGroup as eg:
+            for err in eg.exceptions:
+                logger.warning("CopilotClient stop error: %s", err)
         except Exception:
             logger.exception("Error stopping CopilotClient")
 
@@ -505,8 +510,6 @@ class CopilotAdapter(FoundryCBAgent):
         attrs = super().get_trace_attributes()
         attrs["service.namespace"] = "azure.ai.agentserver.copilot"
         return attrs
-
-
 
 
 async def _iter_copilot_events(session, prompt: str, attachments: Optional[list] = None, timeout: int = 120):

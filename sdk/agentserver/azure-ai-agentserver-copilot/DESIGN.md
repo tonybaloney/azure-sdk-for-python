@@ -67,8 +67,19 @@ ASSISTANT_TURN_END
 SESSION_IDLE
 ```
 
-Additional tool-related events (`MCP_APPROVAL_REQUEST`, `ASSISTANT_REASONING`)
-may appear but are not part of the core conversion flow.
+Additional events may appear between or alongside the core turn events:
+
+- `ASSISTANT_REASONING` / `ASSISTANT_REASONING_DELTA` — chain-of-thought text
+- `ASSISTANT_INTENT` — classified user intent
+- `MCP_APPROVAL_REQUEST` — tool requests approval (handled by the permission system)
+- `TOOL_EXECUTION_PROGRESS` — progress messages during long-running tools
+- `TOOL_EXECUTION_PARTIAL_RESULT` — intermediate outputs from tools
+- `SUBAGENT_SELECTED` / `SUBAGENT_STARTED` / `SUBAGENT_COMPLETED` / `SUBAGENT_FAILED` — sub-agent delegation
+- `SESSION_COMPACTION_START` / `SESSION_COMPACTION_COMPLETE` — context window compaction
+- `SESSION_TRUNCATION` — message truncation after context overflow
+- `SESSION_WARNING` — non-fatal warnings (e.g. rate limits, degraded mode)
+
+None of these affect the core RAPI conversion flow.
 
 ### Key ordering guarantees
 
@@ -193,15 +204,20 @@ neither should occur under normal operation).
 ## Observability
 
 The adapter emits OpenTelemetry spans following the
-[MCP semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/):
+[GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/):
 
-- **`invoke_agent`** span — wraps the entire streaming session, enriched with
-  token usage and model information from `ASSISTANT_USAGE`
-- **`tools/call`** child spans — one per tool execution, opened on
-  `TOOL_EXECUTION_START` and closed on `TOOL_EXECUTION_COMPLETE`
+- **`chat {agent_name}`** span (kind: `CLIENT`) — wraps the entire streaming
+  session, with `gen_ai.operation.name = "chat"`.  Enriched with token usage
+  and model information from `ASSISTANT_USAGE` events.
+- **`tools/call {tool_name}`** child spans (kind: `CLIENT`) — one per tool
+  execution, opened on `TOOL_EXECUTION_START` and closed on
+  `TOOL_EXECUTION_COMPLETE`.  Follows
+  [MCP semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/).
 
 All Copilot SDK events are logged at INFO level with event type and content
-length, with full data payloads available at DEBUG level.
+length, with full data payloads available at DEBUG level.  `SESSION_ERROR`
+events are additionally logged at WARNING level.  `SESSION_WARNING` events
+are logged at WARNING level.
 
 ## Session Reuse
 
@@ -338,51 +354,3 @@ are lost.
 **Impact:** Clients cannot accurately track costs or understand caching
 efficiency.
 
-### 9. Platform Infrastructure Bug (Streaming)
-
-**Observed behaviour:** The RAPI gateway (Azure AI Foundry + Container Apps
-ingress) drops the final events of every SSE stream.  Events
-`response.output_text.done` through `response.completed` and `data: [DONE]`
-are consistently truncated.  This affects *all* hosted agent adapters
-(Copilot, LangGraph, AgentFramework) identically.
-
-**Workaround status:** No adapter-side workaround found.  Tested sleep delays
-up to 2 seconds with no effect.  Non-streaming mode works correctly.
-
-**Impact:** Streaming responses never receive a `response.completed` event,
-preventing clients from knowing when the response is truly finished.
-
----
-
-## A2A Comparison Notes
-
-The [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/) addresses
-several of these gaps:
-
-| Gap | RAPI | A2A |
-|-----|------|-----|
-| Tool execution visibility | ❌ | ✅ `tool/progress`, `tool/result` messages |
-| Sub-agent delegation | ❌ | ✅ `agent/handoff`, nested agent contexts |
-| Session lifecycle | ❌ | ✅ Session management is core to spec |
-| Rich content types | Partial | ✅ MIME-typed content parts |
-| Approval workflows | ❌ | ✅ `approval/request`, `approval/response` |
-| Streaming completion | ✅ | ✅ But different wire format (JSON-RPC) |
-
-A2A's JSON-RPC-based protocol is more verbose but naturally supports the
-bidirectional, stateful, multi-agent communication patterns that Copilot
-exhibits.  RAPI was designed for single-turn LLM completions and has been
-extended for tool calling, but its unidirectional SSE model struggles with
-complex agent workflows.
-
-Consider A2A if:
-- Tool execution transparency is required
-- Sub-agent delegation needs to be visible
-- Interactive approval workflows are needed
-- Rich content types beyond text/image are important
-- Session-level events (context changes, mode switches) matter
-
-Consider RAPI if:
-- OpenAI client compatibility is paramount
-- Simple text-in/text-out flows dominate
-- Tool execution can remain opaque
-- Ecosystem tooling (SDKs, integrations) is a priority

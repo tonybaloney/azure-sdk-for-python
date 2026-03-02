@@ -105,6 +105,7 @@ rules:
 | `write` | Write or modify files | `fileName`, `diff` |
 | `url` | Fetch HTTP/HTTPS URLs | `url` |
 | `mcp` | Invoke MCP server tools | `toolName`, `serverName` |
+| `custom-tool` | Custom tool invocation | `toolName` |
 
 ### 3. Session Management
 
@@ -149,14 +150,51 @@ The `CopilotStreamingResponseConverter` translates Copilot SDK events into
 RAPI Server-Sent Events.  The mapping follows strict ordering guarantees
 from the Copilot SDK:
 
-| Copilot Event | RAPI Events |
-|---------------|-------------|
-| `ASSISTANT_TURN_START` | `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added` |
-| `ASSISTANT_MESSAGE_DELTA` | `response.output_text.delta` |
-| `ASSISTANT_USAGE` | *(stored for completion)* |
-| `ASSISTANT_MESSAGE` | *(triggers done-event chain)* |
-| `ASSISTANT_TURN_END` | `response.output_text.done`, `response.content_part.done`, `response.output_item.done`, `response.completed` |
-| `SESSION_ERROR` | `response.failed` |
+| Copilot Event | Handling | RAPI Events |
+|---------------|----------|-------------|
+| `ASSISTANT_TURN_START` | Converted | `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added` |
+| `ASSISTANT_MESSAGE_DELTA` | Converted | `response.output_text.delta` |
+| `ASSISTANT_USAGE` | Stored | *(enriches `response.completed` and OTel span)* |
+| `ASSISTANT_MESSAGE` | Deferred | *(triggers done-event chain at `TURN_END`)* |
+| `ASSISTANT_TURN_END` | Converted | `response.output_text.done`, `response.content_part.done`, `response.output_item.done`, `response.completed` |
+| `SESSION_ERROR` | Converted | `response.failed` |
+| `SESSION_IDLE` | Safety net | Forces `response.completed` if not already emitted |
+| `SESSION_WARNING` | Logged | *(WARNING-level log with `warning_type` and message)* |
+| `ASSISTANT_REASONING` | Logged | *(DEBUG-level log of full reasoning text)* |
+| `ASSISTANT_REASONING_DELTA` | Logged | *(DEBUG-level log of streaming reasoning chunks)* |
+| `ASSISTANT_INTENT` | Logged | *(DEBUG-level log of classified intent)* |
+| `TOOL_EXECUTION_START` | OTel span | Opens `tools/call` child span |
+| `TOOL_EXECUTION_COMPLETE` | OTel span | Closes `tools/call` child span |
+| `TOOL_EXECUTION_PROGRESS` | Logged | *(DEBUG-level — no RAPI equivalent)* |
+| `TOOL_EXECUTION_PARTIAL_RESULT` | Logged | *(DEBUG-level — no RAPI equivalent)* |
+| `TOOL_USER_REQUESTED` | Logged | *(DEBUG-level)* |
+| `MCP_APPROVAL_REQUEST` | SDK | *(handled by permission system / ToolAcl)* |
+| `SESSION_START` | Logged | *(DEBUG-level — session lifecycle)* |
+| `SESSION_RESUME` | Logged | *(DEBUG-level)* |
+| `SESSION_SHUTDOWN` | Logged | *(DEBUG-level — includes shutdown metrics)* |
+| `SESSION_CONTEXT_CHANGED` | Logged | *(DEBUG-level)* |
+| `SESSION_MODEL_CHANGE` | Logged | *(DEBUG-level)* |
+| `SESSION_MODE_CHANGED` | Logged | *(DEBUG-level)* |
+| `SESSION_TITLE_CHANGED` | Logged | *(DEBUG-level)* |
+| `SESSION_PLAN_CHANGED` | Logged | *(DEBUG-level)* |
+| `SESSION_TRUNCATION` | Logged | *(DEBUG-level — token/message stats)* |
+| `SESSION_COMPACTION_START` | Logged | *(DEBUG-level)* |
+| `SESSION_COMPACTION_COMPLETE` | Logged | *(DEBUG-level — compaction token stats)* |
+| `SESSION_SNAPSHOT_REWIND` | Logged | *(DEBUG-level)* |
+| `SESSION_HANDOFF` | Logged | *(DEBUG-level)* |
+| `SESSION_WORKSPACE_FILE_CHANGED` | Logged | *(DEBUG-level)* |
+| `SESSION_TASK_COMPLETE` | Logged | *(DEBUG-level)* |
+| `SESSION_USAGE_INFO` | Logged | *(DEBUG-level)* |
+| `SUBAGENT_SELECTED` | Logged | *(DEBUG-level — no RAPI equivalent)* |
+| `SUBAGENT_STARTED` | Logged | *(DEBUG-level)* |
+| `SUBAGENT_COMPLETED` | Logged | *(DEBUG-level)* |
+| `SUBAGENT_FAILED` | Logged | *(DEBUG-level)* |
+| `SUBAGENT_DESELECTED` | Logged | *(DEBUG-level)* |
+| `HOOK_START` / `HOOK_END` | Logged | *(DEBUG-level — no RAPI equivalent)* |
+| `SKILL_INVOKED` | Logged | *(DEBUG-level — no RAPI equivalent)* |
+| `SYSTEM_MESSAGE` / `USER_MESSAGE` | Logged | *(DEBUG-level)* |
+| `PENDING_MESSAGES_MODIFIED` | Logged | *(DEBUG-level)* |
+| `ABORT` / `UNKNOWN` | Logged | *(DEBUG-level)* |
 
 ---
 
@@ -170,11 +208,12 @@ Container Apps via the Foundry Agent Service:
 ```dockerfile
 FROM python:3.12-slim
 
+# Requires Python >=3.11 (SDK 0.1.29+ dependency)
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 COPY . package/
-RUN pip install ./package/ azure-identity "github-copilot-sdk>=0.1.25"
+RUN pip install ./package/ azure-identity "github-copilot-sdk==0.1.29"
 
 COPY samples/hosted_agent/main.py main.py
 COPY samples/hosted_agent/tools_acl.yaml tools_acl.yaml
@@ -246,16 +285,17 @@ python main.py
 ### OpenTelemetry Tracing
 
 The adapter emits OTel spans following
-[MCP semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/):
+[GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/):
 
-**`invoke_agent` span** — wraps the entire streaming session:
-- `gen_ai.operation.name`: `"invoke_agent"`
+**`chat {agent_name}` span** (kind: `CLIENT`) — wraps the entire streaming session:
+- `gen_ai.operation.name`: `"chat"`
 - `gen_ai.agent.name`: agent identifier
 - `gen_ai.request.model`: requested model
 - `gen_ai.response.model`: actual model used
 - `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`
 
-**`tools/call` child spans** — one per tool execution:
+**`tools/call {tool_name}` child spans** (kind: `CLIENT`) — one per tool execution,
+following [MCP semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/):
 - `mcp.method.name`: `"tools/call"`
 - `gen_ai.tool.name`: tool being executed
 - `gen_ai.tool.call.id`: unique call ID

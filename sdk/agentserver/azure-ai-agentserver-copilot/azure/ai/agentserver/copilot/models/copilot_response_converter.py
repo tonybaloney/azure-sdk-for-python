@@ -233,7 +233,7 @@ class CopilotStreamingResponseConverter:
                 if data:
                     error_msg = getattr(data, 'message', None) or getattr(data, 'content', None) or repr(data)
                 self._session_error = error_msg
-                logger.error(f"Copilot session error: {error_msg}")
+                logger.error("Copilot session error: %s", error_msg)
 
                 if not self._completed and not self._failed:
                     error_obj = ResponseError(code="server_error", message=error_msg)
@@ -337,12 +337,28 @@ class CopilotStreamingResponseConverter:
                     )
                     self._completed = True
 
+            # ── Session warning ────────────────────────────────────────────────
+            case SessionEvent(type=SessionEventType.SESSION_WARNING, data=data):
+                warning_type = getattr(data, 'warning_type', None) or "unknown" if data else "unknown"
+                warning_msg = getattr(data, 'message', None) or "" if data else ""
+                logger.warning("Copilot session warning: type=%s message=%s", warning_type, warning_msg)
+
             # ── Reasoning ─────────────────────────────────────────────────────
             case SessionEvent(type=SessionEventType.ASSISTANT_REASONING, data=data):
                 if data and data.content:
-                    logger.debug(f"Copilot reasoning: {data.content[:120]!r}")
+                    logger.debug("Copilot reasoning: %r", data.content[:120])
+
+            # ── Reasoning delta (streaming chunks) ────────────────────────────
+            case SessionEvent(type=SessionEventType.ASSISTANT_REASONING_DELTA, data=data):
+                if data and data.delta_content:
+                    logger.debug("Copilot reasoning delta: %r", data.delta_content[:120])
+
+            # ── Intent classification ─────────────────────────────────────────
+            case SessionEvent(type=SessionEventType.ASSISTANT_INTENT, data=data):
+                if data and data.intent:
+                    logger.debug("Copilot intent: %s", data.intent)
 
             # ── All other events ──────────────────────────────────────────────
             case _:
                 ename = event.type.name if event.type else "UNKNOWN"
-                logger.debug(f"Unhandled Copilot event: {ename}")
+                logger.debug("Unhandled Copilot event: %s", ename)
