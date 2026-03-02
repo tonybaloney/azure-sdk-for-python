@@ -287,8 +287,9 @@ python main.py
 The adapter emits OTel spans following
 [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/):
 
-**`chat {agent_name}` span** (kind: `CLIENT`) — wraps the entire streaming session:
-- `gen_ai.operation.name`: `"chat"`
+**`invoke_agent {agent_name}` span** (kind: `CLIENT`) — wraps the entire streaming session
+per the [GenAI agent span semconv](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/#invoke-agent-span):
+- `gen_ai.operation.name`: `"invoke_agent"`
 - `gen_ai.agent.name`: agent identifier
 - `gen_ai.request.model`: requested model
 - `gen_ai.response.model`: actual model used

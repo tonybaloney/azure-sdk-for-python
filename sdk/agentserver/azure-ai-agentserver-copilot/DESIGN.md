@@ -206,8 +206,10 @@ neither should occur under normal operation).
 The adapter emits OpenTelemetry spans following the
 [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/):
 
-- **`chat {agent_name}`** span (kind: `CLIENT`) — wraps the entire streaming
-  session, with `gen_ai.operation.name = "chat"`.  Enriched with token usage
+- **`invoke_agent {agent_name}`** span (kind: `CLIENT`) — wraps the entire
+  streaming session, with `gen_ai.operation.name = "invoke_agent"` per the
+  [GenAI agent span semconv](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/#invoke-agent-span).
+  Enriched with token usage
   and model information from `ASSISTANT_USAGE` events.
 - **`tools/call {tool_name}`** child spans (kind: `CLIENT`) — one per tool
   execution, opened on `TOOL_EXECUTION_START` and closed on

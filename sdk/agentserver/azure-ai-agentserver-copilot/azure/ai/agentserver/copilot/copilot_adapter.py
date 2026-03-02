@@ -311,7 +311,7 @@ class CopilotAdapter(FoundryCBAgent):
             span_attrs = self._build_invoke_span_attrs(config, context, conversation_id)
             agent_name = span_attrs.get("gen_ai.agent.name", "")
             with self.tracer.start_as_current_span(
-                name="chat %s" % agent_name,
+                name="invoke_agent %s" % agent_name,
                 kind=trace.SpanKind.CLIENT,
                 attributes=span_attrs,
             ) as span:
@@ -343,7 +343,7 @@ class CopilotAdapter(FoundryCBAgent):
     def _build_invoke_span_attrs(
         self, config, context: AgentRunContext, conversation_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Build OpenTelemetry span attributes for a ``chat`` span.
+        """Build OpenTelemetry span attributes for an ``invoke_agent`` span.
 
         Agent identity is resolved from the request context first (consistent
         with the base class ``set_run_context_to_context_var``).  Falls back to
@@ -369,7 +369,7 @@ class CopilotAdapter(FoundryCBAgent):
 
         request_model = config.get("model", "") if hasattr(config, "get") else ""
         attrs: Dict[str, Any] = {
-            "gen_ai.operation.name": "chat",
+            "gen_ai.operation.name": "invoke_agent",
             "gen_ai.provider.name": "github.copilot",
             "gen_ai.agent.id": agent_id,
             "gen_ai.agent.name": agent_name,
@@ -390,7 +390,7 @@ class CopilotAdapter(FoundryCBAgent):
         """Async generator: converts Copilot events → RAPI stream events on-the-fly.
 
         Uses the base class's ``self.tracer`` (set up by ``init_tracing()``) to
-        create a ``chat`` span covering the full stream.  The
+        create an ``invoke_agent`` span covering the full stream.  The
         ``start_as_current_span`` context manager handles span lifecycle,
         context propagation, and exception recording automatically.
 
@@ -399,7 +399,7 @@ class CopilotAdapter(FoundryCBAgent):
 
         Per-tool ``execute_tool`` child spans are opened on
         ``TOOL_EXECUTION_START`` and closed on ``TOOL_EXECUTION_COMPLETE``.
-        They automatically inherit the ``chat`` span as parent
+        They automatically inherit the ``invoke_agent`` span as parent
         via the current trace context.
         """
         span_attrs = self._build_invoke_span_attrs(config, context, context.conversation_id)
@@ -408,7 +408,7 @@ class CopilotAdapter(FoundryCBAgent):
         tool_spans: Dict[str, Any] = {}
 
         with self.tracer.start_as_current_span(
-            name="chat %s" % agent_name,
+            name="invoke_agent %s" % agent_name,
             kind=trace.SpanKind.CLIENT,
             attributes=span_attrs,
         ) as span:
