@@ -10,7 +10,7 @@ import json
 import os
 import urllib.parse
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
 from copilot import CopilotClient, MessageOptions, ProviderConfig, SessionConfig
 from copilot.generated.session_events import SessionEventType
@@ -31,13 +31,10 @@ from .tool_acl import ToolAcl
 
 logger = get_logger()
 
-
-class _HealthCheckFilter(logging.Filter):
-    """Drop health-check access-log records so they don't pollute logs."""
-
-    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
-        msg = record.getMessage()
-        return not any(p in msg for p in ("/liveness", "/readiness"))
+_PermissionHandlerFn = Callable[
+    [PermissionRequest, dict[str, str]],
+    Union[PermissionRequestResult, Awaitable[PermissionRequestResult]],
+]
 
 _COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
 
@@ -86,8 +83,8 @@ def _build_session_config() -> SessionConfig:
                     foundry_url,
                 )
             foundry_url = urllib.parse.urljoin(foundry_url, "/openai/v1/")
-        api_key = os.getenv("AZURE_AI_FOUNDRY_API_KEY")
 
+        api_key = os.getenv("AZURE_AI_FOUNDRY_API_KEY")
         if api_key:
             logger.info("Using API auth with FOUNDRY URL: %s", foundry_url)
             return SessionConfig(
@@ -115,71 +112,88 @@ def _build_session_config() -> SessionConfig:
     logger.info("No FOUNDRY URL configured, using default Copilot provider with model %r", model)
     return SessionConfig(model=model)
 
+def _on_permission_from_acl(acl: ToolAcl) -> _PermissionHandlerFn:
+    """
+    Build an on_permission_request handler from a ToolAcl.
+    """
+
+    def _on_permission(req: PermissionRequest, _ctx: dict) -> PermissionRequestResult:
+        kind = req.get("kind", "unknown")
+        if acl is None:
+            # No ACL configured — approve everything (development / local mode).
+            logger.info(f"Auto-approving tool request (no ACL): kind={kind}")
+            return PermissionRequestResult(kind="approved")
+
+        if acl.is_allowed(req):
+            logger.info(f"ACL allowed tool request: kind={kind}")
+            return PermissionRequestResult(kind="approved")
+        else:
+            logger.warning(f"ACL denied tool request: kind={kind}")
+            return PermissionRequestResult(
+                kind="denied-by-rules",
+                rules=[],
+            )
+    return _on_permission
 
 class CopilotAdapter(FoundryCBAgent):
     """Adapter that bridges a GitHub Copilot SDK session to an Azure AI Agent Server.
 
-    When ``AZURE_AI_FOUNDRY_RESOURCE_URL`` is set the adapter uses Azure AI
+    When ``AZURE_AI_FOUNDRY_RESOURCE_URL`` is set the adapter uses Microsoft
     Foundry models via BYOK with Managed Identity authentication.  Otherwise
     it falls back to the default GitHub Copilot models.
+
+    Use acl or on_permission_request to control tool access.  When using an ACL, the adapter looks for a YAML ACL file path in the
+    ``TOOL_ACL_PATH`` environment variable if the ACL is not provided explicitly.
+    acl takes priority over on_permission_request callback if both are provided.  
+    If neither is provided, the SDK defaults will be used.
 
     :param session_config: Override for the Copilot session config.  When
         *None* the config is built automatically from environment variables.
     :type session_config: Optional[SessionConfig]
+    :param acl: Optional tool ACL.  If not provided, the adapter looks for a YAML ACL file path in the
+        ``TOOL_ACL_PATH`` environment variable.  If neither is set, on_permission_request will be used.
+    :type acl: Optional[ToolAcl]
+    :param on_permission_request: Optional callback to handle tool permission requests.
+    :type on_permission_request: Optional[_PermissionHandlerFn]
     """
+    _client: Optional[CopilotClient]
+    _on_permission_fn: Optional[_PermissionHandlerFn]
 
     def __init__(
         self,
         session_config: Optional[SessionConfig] = None,
         acl: Optional[ToolAcl] = None,
+        on_permission_request: Optional[_PermissionHandlerFn] = None,
     ):
         super().__init__()
-
-        # Register a startup event to suppress health-check noise.
-        # This MUST be a startup event (not inline __init__ code) because
-        # uvicorn's configure_logging() calls dictConfig() which resets
-        # loggers and clears any filters we add before the server starts.
-        # Startup events fire AFTER uvicorn's logging is configured.
-        @self.app.on_event("startup")
-        async def _suppress_health_check_logs():
-            _hc_filter = _HealthCheckFilter()
-            for _name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
-                logging.getLogger(_name).addFilter(_hc_filter)
 
         # Build default config (handles provider setup from env vars)
         default_config = _build_session_config()
 
         if session_config is not None:
-            # Merge user-provided config with default config.
-            # User config takes priority for most fields, but provider
-            # is taken from default if not specified by user.
-            merged = dict(default_config)  # Start with default
-            user_dict = dict(session_config)
-
-            # Merge user settings — only override if user provided a non-None value
-            for key, value in user_dict.items():
-                if value is not None:
-                    merged[key] = value
-
-            self._session_config = SessionConfig(**merged)  # type: ignore[arg-type]
+            # Python 3.10+ has dictionary union operators.
+            self._session_config = SessionConfig(**default_config | session_config)  # type: ignore[arg-type]
         else:
             self._session_config = default_config
 
         self._client: Optional[CopilotClient] = None
         self._credential = None
 
-        # Tool ACL: explicit parameter takes priority over TOOL_ACL_PATH env var.
-        # If neither is set, every tool request is auto-approved (approve-all).
+        # Permission handler function is one of (in order of precedence):
+        # 1. From provided ACL
+        # 2. From ACL loaded from environment variable path
+        # 3. The provided on_permission_request callback
+        # 4. SDK default
         if acl is not None:
-            self._acl: Optional[ToolAcl] = acl
-        else:
-            self._acl = ToolAcl.from_env("TOOL_ACL_PATH")
-            if self._acl is None:
-                logger.warning(
-                    "No tool ACL configured (TOOL_ACL_PATH not set). "
-                    "All tool requests will be auto-approved. "
-                    "Set TOOL_ACL_PATH to a YAML ACL file for production use."
-                )
+            self._on_permission_fn = _on_permission_from_acl(acl)
+        elif os.getenv("TOOL_ACL_PATH"):
+            logger.info("Loading tool ACL from %s", os.getenv("TOOL_ACL_PATH"))
+            loaded_acl = ToolAcl.from_env("TOOL_ACL_PATH")
+            if loaded_acl is not None:
+                self._on_permission_fn = _on_permission_from_acl(loaded_acl)
+        
+        if self._on_permission_fn is None:
+            self._on_permission_fn = on_permission_request
 
         # Multi-turn: map conversation_id → live CopilotSession (LRU-bounded)
         _MAX_SESSIONS = int(os.getenv("COPILOT_MAX_SESSIONS", "1000"))
@@ -205,15 +219,6 @@ class CopilotAdapter(FoundryCBAgent):
         self._session_config["provider"]["bearer_token"] = token.token
         return self._session_config
 
-    async def _ensure_client(self) -> CopilotClient:
-        """Lazily start the CopilotClient."""
-        if self._client is None:
-            self._client = CopilotClient()
-            await self._client.start()
-            logger.info("CopilotClient started")
-        return self._client
-
-
     async def agent_run(self, context: AgentRunContext):
 
         req_converter = CopilotRequestConverter(context.request)
@@ -223,27 +228,10 @@ class CopilotAdapter(FoundryCBAgent):
         if converted_attachments:
             logger.debug(f"Attachments: {len(converted_attachments.attachments)} item(s)")
 
-        client = await self._ensure_client()
+        self._client = CopilotClient()
+        await self._client.start()
+
         config = await self._refresh_token_if_needed()
-
-        acl = self._acl
-
-        def _on_permission(req: PermissionRequest, _ctx: dict) -> PermissionRequestResult:
-            kind = req.get("kind", "unknown")
-            if acl is None:
-                # No ACL configured — approve everything (development / local mode).
-                logger.info(f"Auto-approving tool request (no ACL): kind={kind}")
-                return PermissionRequestResult(kind="approved")
-
-            if acl.is_allowed(req):
-                logger.info(f"ACL allowed tool request: kind={kind}")
-                return PermissionRequestResult(kind="approved")
-            else:
-                logger.warning(f"ACL denied tool request: kind={kind}")
-                return PermissionRequestResult(
-                    kind="denied-by-rules",
-                    rules=[],
-                )
 
         conversation_id = context.conversation_id
         session = self._sessions.get(conversation_id) if conversation_id else None
@@ -254,8 +242,8 @@ class CopilotAdapter(FoundryCBAgent):
                 + (f" for conversation {conversation_id!r}" if conversation_id else "")
             )
             # TODO: on_user_input_request needs a callback
-            session_config = SessionConfig(**config, on_permission_request=_on_permission)
-            session = await client.create_session(session_config)
+            session_config = SessionConfig(**config, on_permission_request=self._on_permission_fn)
+            session = await self._client.create_session(session_config)
             if conversation_id:
                 self._sessions[conversation_id] = session
                 # Evict oldest session if we've exceeded the cap
