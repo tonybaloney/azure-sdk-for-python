@@ -15,6 +15,7 @@ from copilot import CopilotClient, MessageOptions, PermissionHandler, ProviderCo
 from copilot.generated.session_events import SessionEventType
 from copilot.types import PermissionRequest, PermissionRequestResult
 from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 
 from azure.ai.agentserver.core.constants import Constants
 from azure.ai.agentserver.core.logger import get_logger
@@ -26,9 +27,26 @@ from azure.identity import DefaultAzureCredential
 from .models.copilot_request_converter import ConvertedAttachments, CopilotRequestConverter
 from .models.copilot_response_converter import CopilotResponseConverter, CopilotStreamingResponseConverter
 from .tool_acl import ToolAcl
+from ._types import InvokeAgentSpanAttrs, ToolCallSpanAttrs
 
 
 logger = get_logger()
+
+
+def _error_type_name(exc: BaseException) -> str:
+    """Return a fully-qualified type name for ``error.type``.
+
+    Follows the `OTel recording-errors guidance
+    <https://opentelemetry.io/docs/specs/semconv/general/recording-errors/>`_:
+    use the canonical (fully-qualified) exception type name.
+    """
+    cls = type(exc)
+    module = cls.__module__ or ""
+    qualname = cls.__qualname__
+    if module and module != "builtins":
+        return "%s.%s" % (module, qualname)
+    return qualname
+
 
 _PermissionHandlerFn = Callable[
     [PermissionRequest, dict[str, str]],
@@ -36,6 +54,7 @@ _PermissionHandlerFn = Callable[
 ]
 
 _COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
+
 
 DEFAULT_MODEL = "gpt-4.1"  # Lowest-cost default, but should be user specified in most cases.
 
@@ -316,12 +335,22 @@ class CopilotAdapter(FoundryCBAgent):
                 attributes=span_attrs,
             ) as span:
                 text = ""
+                session_errored = False
                 try:
                     async for event in _iter_copilot_events(
                         session, prompt, attachments=converted_attachments.attachments
                     ):
                         if event.type == SessionEventType.ASSISTANT_MESSAGE and event.data and event.data.content:
                             text = event.data.content
+                        elif event.type == SessionEventType.SESSION_ERROR and event.data:
+                            error_msg = (
+                                getattr(event.data, "message", None)
+                                or getattr(event.data, "content", None)
+                                or repr(event.data)
+                            )
+                            span.set_attribute("error.type", "session_error")
+                            span.set_status(StatusCode.ERROR, error_msg)
+                            session_errored = True
                         elif event.type == SessionEventType.ASSISTANT_USAGE and event.data:
                             if event.data.model:
                                 span.set_attribute("gen_ai.response.model", event.data.model)
@@ -330,20 +359,29 @@ class CopilotAdapter(FoundryCBAgent):
                             if event.data.output_tokens is not None:
                                 span.set_attribute("gen_ai.usage.output_tokens", int(event.data.output_tokens))
                 except Exception as e:
-                    span.set_attribute("error.type", type(e).__name__)
+                    span.set_attribute("error.type", _error_type_name(e))
+                    span.set_status(StatusCode.ERROR, str(e))
+                    span.record_exception(e)
                     raise
                 finally:
                     converted_attachments.cleanup()
-                span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
+                if session_errored:
+                    span.set_attribute("gen_ai.response.finish_reasons", ["error"])
+                else:
+                    span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
             return CopilotResponseConverter.to_response(text, context)
 
         # Return an async generator that yields RAPI events as Copilot events arrive.
         return self._run_streaming(session, prompt, converted_attachments, context, config)
 
     def _build_invoke_span_attrs(
-        self, config, context: AgentRunContext, conversation_id: Optional[str] = None
-    ) -> Dict[str, Any]:
+        self, config: SessionConfig, context: AgentRunContext, conversation_id: Optional[str] = None
+    ) -> InvokeAgentSpanAttrs:
         """Build OpenTelemetry span attributes for an ``invoke_agent`` span.
+
+        Returns an :class:`InvokeAgentSpanAttrs` TypedDict whose keys mirror
+        the `GenAI agent span semconv
+        <https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/#invoke-agent-span>`_.
 
         Agent identity is resolved from the request context first (consistent
         with the base class ``set_run_context_to_context_var``).  Falls back to
@@ -352,6 +390,7 @@ class CopilotAdapter(FoundryCBAgent):
         """
         agent_name = ""
         agent_id = ""
+        agent_version = ""
         agent_obj = context.get_agent_id_object()
         if agent_obj:
             agent_name = getattr(agent_obj, "name", "") or ""
@@ -367,16 +406,29 @@ class CopilotAdapter(FoundryCBAgent):
         if not agent_id:
             agent_id = agent_name
 
-        request_model = config.get("model", "") if hasattr(config, "get") else ""
-        attrs: Dict[str, Any] = {
+        request_model = config.get("model", "")
+        attrs: InvokeAgentSpanAttrs = {
             "gen_ai.operation.name": "invoke_agent",
             "gen_ai.provider.name": "github.copilot",
             "gen_ai.agent.id": agent_id,
             "gen_ai.agent.name": agent_name,
             "gen_ai.request.model": request_model,
+            "gen_ai.response.id": context.response_id,
         }
+        if agent_version:
+            attrs["gen_ai.agent.version"] = agent_version
         if conversation_id:
             attrs["gen_ai.conversation.id"] = conversation_id
+        provider = config.get("provider")
+        if provider and isinstance(provider, dict):
+            base_url = provider.get("base_url", "")
+            if base_url:
+                parsed = urllib.parse.urlparse(base_url)
+                if parsed.hostname:
+                    attrs["server.address"] = parsed.hostname
+                    port = parsed.port
+                    if port:
+                        attrs["server.port"] = port
         return attrs
 
     async def _run_streaming(
@@ -385,7 +437,7 @@ class CopilotAdapter(FoundryCBAgent):
         prompt: str,
         converted_attachments: ConvertedAttachments,
         context: AgentRunContext,
-        config: Any,
+        config: SessionConfig,
     ):
         """Async generator: converts Copilot events → RAPI stream events on-the-fly.
 
@@ -405,7 +457,8 @@ class CopilotAdapter(FoundryCBAgent):
         span_attrs = self._build_invoke_span_attrs(config, context, context.conversation_id)
         agent_name = span_attrs.get("gen_ai.agent.name", "")
         # tool_call_id → child Span for in-flight tool executions
-        tool_spans: Dict[str, Any] = {}
+        tool_spans: Dict[str, trace.Span] = {}
+        session_errored = False
 
         with self.tracer.start_as_current_span(
             name="invoke_agent %s" % agent_name,
@@ -426,16 +479,12 @@ class CopilotAdapter(FoundryCBAgent):
                     if copilot_event.type == SessionEventType.TOOL_EXECUTION_START and data:
                         call_id = data.tool_call_id or str(uuid.uuid4())
                         tool_name = data.mcp_tool_name or data.tool_name or "unknown"
-                        tool_attrs: Dict[str, Any] = {
-                            # Required by MCP semconv
+                        tool_attrs: ToolCallSpanAttrs = {
                             "mcp.method.name": "tools/call",
-                            # Conditionally required when tool is present
                             "gen_ai.tool.name": tool_name,
-                            # Recommended
                             "gen_ai.operation.name": "execute_tool",
                             "network.transport": "pipe",  # Copilot SDK uses stdio
                         }
-                        # mcp.session.id — recommended when part of a session
                         try:
                             tool_attrs["mcp.session.id"] = session.session_id
                         except AttributeError:
@@ -444,7 +493,6 @@ class CopilotAdapter(FoundryCBAgent):
                             tool_attrs["gen_ai.tool.call.id"] = call_id
                         if data.mcp_server_name:
                             tool_attrs["mcp.server.name"] = data.mcp_server_name
-                        # gen_ai.tool.call.arguments — opt-in per MCP semconv
                         if data.arguments is not None:
                             try:
                                 tool_attrs["gen_ai.tool.call.arguments"] = json.dumps(data.arguments)
@@ -472,8 +520,23 @@ class CopilotAdapter(FoundryCBAgent):
                             # error.type — required when tool execution failed
                             if hasattr(data, "success") and data.success is False:
                                 tool_span.set_attribute("error.type", "tool_error")
+                                tool_span.set_status(StatusCode.ERROR, "tool execution failed")
                             tool_span.end()
                             logger.debug("Tool span ended: call_id=%r", call_id)
+
+                    # ── Session error: mark span as errored ─────────────────────
+                    # The Copilot SDK delivers errors as SESSION_ERROR events
+                    # rather than raising exceptions.  Per OTel recording-errors
+                    # guidance, we SHOULD set error.type and span status to Error.
+                    elif copilot_event.type == SessionEventType.SESSION_ERROR and data:
+                        error_msg = (
+                            getattr(data, "message", None)
+                            or getattr(data, "content", None)
+                            or repr(data)
+                        )
+                        span.set_attribute("error.type", "session_error")
+                        span.set_status(StatusCode.ERROR, error_msg)
+                        session_errored = True
 
                     # ── Enrich parent span from usage event ───────────────────────
                     elif copilot_event.type == SessionEventType.ASSISTANT_USAGE and data:
@@ -494,15 +557,22 @@ class CopilotAdapter(FoundryCBAgent):
                 # NOT help — tested up to 2 seconds with no effect.  The issue is
                 # in the platform infrastructure, not timing.
 
-                span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
+                # If the stream carried a SESSION_ERROR the finish reason is "error".
+                if session_errored:
+                    span.set_attribute("gen_ai.response.finish_reasons", ["error"])
+                else:
+                    span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
             except Exception as e:
-                span.set_attribute("error.type", type(e).__name__)
+                span.set_attribute("error.type", _error_type_name(e))
+                span.set_status(StatusCode.ERROR, str(e))
+                span.record_exception(e)
                 logger.error("Error during Copilot streaming: %s", e)
                 raise
             finally:
                 # Close any tool spans that were never completed (e.g. stream aborted)
                 for _call_id, tool_span in list(tool_spans.items()):
                     tool_span.set_attribute("error.type", "stream_aborted")
+                    tool_span.set_status(StatusCode.ERROR, "stream aborted")
                     tool_span.end()
                 converted_attachments.cleanup()
 
