@@ -5,7 +5,6 @@
 import asyncio
 import collections
 import dataclasses
-import logging
 import json
 import os
 import urllib.parse
@@ -40,6 +39,7 @@ _COGNITIVE_SERVICES_SCOPE = "https://cognitiveservices.azure.com/.default"
 
 DEFAULT_MODEL = "gpt-4.1"  # Lowest-cost default, but should be user specified in most cases.
 
+
 def _build_session_config() -> SessionConfig:
     """Build a SessionConfig from environment variables.
 
@@ -72,7 +72,7 @@ def _build_session_config() -> SessionConfig:
     model = os.getenv("COPILOT_MODEL", DEFAULT_MODEL)  # gpt-4.1 is 0x
 
     if foundry_url:
-        # Validate the URL conforms to either of https://domain/openai/v1/ or https://domain/ 
+        # Validate the URL conforms to either of https://domain/openai/v1/ or https://domain/
         # and normalize to https://domain/openai/v1/ if needed.
         parsed = urllib.parse.urlparse(foundry_url)
         if not parsed.path.endswith("/openai/v1/"):
@@ -112,6 +112,7 @@ def _build_session_config() -> SessionConfig:
     logger.info("No FOUNDRY URL configured, using default Copilot provider with model %r", model)
     return SessionConfig(model=model)
 
+
 def _on_permission_from_acl(acl: ToolAcl) -> _PermissionHandlerFn:
     """
     Build an on_permission_request handler from a ToolAcl.
@@ -133,7 +134,9 @@ def _on_permission_from_acl(acl: ToolAcl) -> _PermissionHandlerFn:
                 kind="denied-by-rules",
                 rules=[],
             )
+
     return _on_permission
+
 
 class CopilotAdapter(FoundryCBAgent):
     """Adapter that bridges a GitHub Copilot SDK session to an Azure AI Agent Server.
@@ -144,7 +147,7 @@ class CopilotAdapter(FoundryCBAgent):
 
     Use acl or on_permission_request to control tool access.  When using an ACL, the adapter looks for a YAML ACL file path in the
     ``TOOL_ACL_PATH`` environment variable if the ACL is not provided explicitly.
-    acl takes priority over on_permission_request callback if both are provided.  
+    acl takes priority over on_permission_request callback if both are provided.
     If neither is provided, the SDK defaults will be used.
 
     :param session_config: Override for the Copilot session config.  When
@@ -156,6 +159,7 @@ class CopilotAdapter(FoundryCBAgent):
     :param on_permission_request: Optional callback to handle tool permission requests.
     :type on_permission_request: Optional[_PermissionHandlerFn]
     """
+
     _client: Optional[CopilotClient]
     _on_permission_fn: Optional[_PermissionHandlerFn]
 
@@ -179,6 +183,7 @@ class CopilotAdapter(FoundryCBAgent):
         self._client: Optional[CopilotClient] = None
         self._client_lock = asyncio.Lock()
         self._credential = None
+        self._on_permission_fn: Optional[_PermissionHandlerFn] = None
 
         # Permission handler function is one of (in order of precedence):
         # 1. From provided ACL
@@ -192,7 +197,7 @@ class CopilotAdapter(FoundryCBAgent):
             loaded_acl = ToolAcl.from_env("TOOL_ACL_PATH")
             if loaded_acl is not None:
                 self._on_permission_fn = _on_permission_from_acl(loaded_acl)
-        
+
         if self._on_permission_fn is None:
             self._on_permission_fn = on_permission_request
 
@@ -219,9 +224,7 @@ class CopilotAdapter(FoundryCBAgent):
         if self._credential is None or "provider" not in self._session_config:
             return self._session_config
 
-        token = await asyncio.to_thread(
-            self._credential.get_token, _COGNITIVE_SERVICES_SCOPE
-        )
+        token = await asyncio.to_thread(self._credential.get_token, _COGNITIVE_SERVICES_SCOPE)
         self._session_config["provider"]["bearer_token"] = token.token
         return self._session_config
 
@@ -291,32 +294,79 @@ class CopilotAdapter(FoundryCBAgent):
                 logger.debug("Cached session %r under conversation %r", session.session_id, conversation_id)
         else:
             self._sessions.move_to_end(conversation_id)
-            logger.info("Reusing Copilot session %r for conversation turn (conversation=%r)", session.session_id, conversation_id)
+            logger.info(
+                "Reusing Copilot session %r for conversation turn (conversation=%r)",
+                session.session_id,
+                conversation_id,
+            )
 
         if not context.stream:
             # Non-streaming: collect all events and extract the final text
             # from the authoritative ASSISTANT_MESSAGE event.
-            text = ""
-            try:
-                async for event in _iter_copilot_events(session, prompt, attachments=converted_attachments.attachments):
-                    if event.type == SessionEventType.ASSISTANT_MESSAGE and event.data and event.data.content:
-                        text = event.data.content
-            finally:
-                converted_attachments.cleanup()
+            span_attrs = self._build_invoke_span_attrs(config, context, conversation_id)
+            agent_name = span_attrs.get("gen_ai.agent.name", "")
+            with self.tracer.start_as_current_span(
+                name="chat %s" % agent_name,
+                kind=trace.SpanKind.CLIENT,
+                attributes=span_attrs,
+            ) as span:
+                text = ""
+                try:
+                    async for event in _iter_copilot_events(
+                        session, prompt, attachments=converted_attachments.attachments
+                    ):
+                        if event.type == SessionEventType.ASSISTANT_MESSAGE and event.data and event.data.content:
+                            text = event.data.content
+                        elif event.type == SessionEventType.ASSISTANT_USAGE and event.data:
+                            if event.data.model:
+                                span.set_attribute("gen_ai.response.model", event.data.model)
+                            if event.data.input_tokens is not None:
+                                span.set_attribute("gen_ai.usage.input_tokens", int(event.data.input_tokens))
+                            if event.data.output_tokens is not None:
+                                span.set_attribute("gen_ai.usage.output_tokens", int(event.data.output_tokens))
+                except Exception as e:
+                    span.set_attribute("error.type", type(e).__name__)
+                    raise
+                finally:
+                    converted_attachments.cleanup()
+                span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
             return CopilotResponseConverter.to_response(text, context)
 
-        # Streaming: return an async generator so events flow to the client
-        # immediately as the Copilot SDK emits them — no wait-until-idle.
+        # Return an async generator that yields RAPI events as Copilot events arrive.
         return self._run_streaming(session, prompt, converted_attachments, context, config)
 
-    def _build_invoke_span_attrs(self, config, conversation_id: Optional[str] = None) -> Dict[str, Any]:
-        """Build OpenTelemetry span attributes for an ``invoke_agent`` span."""
-        agent_name = self.get_agent_identifier()
+    def _build_invoke_span_attrs(
+        self, config, context: AgentRunContext, conversation_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Build OpenTelemetry span attributes for a ``chat`` span.
+
+        Agent identity is resolved from the request context first (consistent
+        with the base class ``set_run_context_to_context_var``).  Falls back to
+        the ``AGENT_NAME`` / ``AGENT_ID`` environment variables, then to a
+        hardcoded default.
+        """
+        agent_name = ""
+        agent_id = ""
+        agent_obj = context.get_agent_id_object()
+        if agent_obj:
+            agent_name = getattr(agent_obj, "name", "") or ""
+            agent_version = getattr(agent_obj, "version", "") or ""
+            agent_id = "%s:%s" % (agent_name, agent_version) if agent_version else agent_name
+
+        if not agent_name:
+            agent_name = os.getenv(Constants.AGENT_NAME, "")
+        if not agent_id:
+            agent_id = os.getenv(Constants.AGENT_ID, "")
+        if not agent_name:
+            agent_name = agent_id or "HostedAgent-Copilot"
+        if not agent_id:
+            agent_id = agent_name
+
         request_model = config.get("model", "") if hasattr(config, "get") else ""
         attrs: Dict[str, Any] = {
-            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.operation.name": "chat",
             "gen_ai.provider.name": "github.copilot",
-            "gen_ai.agent.id": "copilot",
+            "gen_ai.agent.id": agent_id,
             "gen_ai.agent.name": agent_name,
             "gen_ai.request.model": request_model,
         }
@@ -335,7 +385,7 @@ class CopilotAdapter(FoundryCBAgent):
         """Async generator: converts Copilot events → RAPI stream events on-the-fly.
 
         Uses the base class's ``self.tracer`` (set up by ``init_tracing()``) to
-        create an ``invoke_agent`` span covering the full stream.  The
+        create a ``chat`` span covering the full stream.  The
         ``start_as_current_span`` context manager handles span lifecycle,
         context propagation, and exception recording automatically.
 
@@ -344,22 +394,24 @@ class CopilotAdapter(FoundryCBAgent):
 
         Per-tool ``execute_tool`` child spans are opened on
         ``TOOL_EXECUTION_START`` and closed on ``TOOL_EXECUTION_COMPLETE``.
-        They automatically inherit the ``invoke_agent`` span as parent
+        They automatically inherit the ``chat`` span as parent
         via the current trace context.
         """
-        span_attrs = self._build_invoke_span_attrs(config, context.conversation_id)
+        span_attrs = self._build_invoke_span_attrs(config, context, context.conversation_id)
         agent_name = span_attrs.get("gen_ai.agent.name", "")
         # tool_call_id → child Span for in-flight tool executions
         tool_spans: Dict[str, Any] = {}
 
         with self.tracer.start_as_current_span(
-            name=f"invoke_agent {agent_name}",
+            name="chat %s" % agent_name,
             kind=trace.SpanKind.CLIENT,
             attributes=span_attrs,
         ) as span:
             try:
                 converter = CopilotStreamingResponseConverter(context)
-                async for copilot_event in _iter_copilot_events(session, prompt, attachments=converted_attachments.attachments):
+                async for copilot_event in _iter_copilot_events(
+                    session, prompt, attachments=converted_attachments.attachments
+                ):
                     data = copilot_event.data
 
                     # ── Tool execution start: open a child span ────────────────────
@@ -454,14 +506,7 @@ class CopilotAdapter(FoundryCBAgent):
         attrs["service.namespace"] = "azure.ai.agentserver.copilot"
         return attrs
 
-    def get_agent_identifier(self) -> str:
-        agent_name = os.getenv(Constants.AGENT_NAME)
-        if agent_name:
-            return agent_name
-        agent_id = os.getenv(Constants.AGENT_ID)
-        if agent_id:
-            return agent_id
-        return "HostedAgent-Copilot"
+
 
 
 async def _iter_copilot_events(session, prompt: str, attachments: Optional[list] = None, timeout: int = 120):
@@ -504,7 +549,7 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
         # Always log SESSION_ERROR details at WARNING level so production logs contain
         # enough information to diagnose model/auth/infra failures without DEBUG.
         if event.type == SessionEventType.SESSION_ERROR and event.data:
-            error_msg = getattr(event.data, 'message', None) or getattr(event.data, 'content', None) or repr(event.data)
+            error_msg = getattr(event.data, "message", None) or getattr(event.data, "content", None) or repr(event.data)
             logger.warning("SESSION_ERROR details: %s", error_msg)
         if logger.isEnabledFor(10):  # DEBUG
             data_fields: Dict[str, Any] = {}
@@ -516,7 +561,9 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
                     data_fields = {"repr": repr(event.data)}
             logger.debug(
                 "Event #%03d %s data=%s",
-                event_count, event_name, data_fields,
+                event_count,
+                event_name,
+                data_fields,
             )
 
         queue.put_nowait(event)
@@ -541,4 +588,3 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
             yield event
     finally:
         unsubscribe()
-

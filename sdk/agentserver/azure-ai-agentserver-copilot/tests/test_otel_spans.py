@@ -96,8 +96,8 @@ def _otel_server():
 # ── Tests ───────────────────────────────────────────────────────────────────────
 
 @pytest.mark.integration
-def test_streaming_request_produces_invoke_agent_span(_otel_server):
-    """A streaming /responses request must produce an invoke_agent span."""
+def test_streaming_request_produces_chat_span(_otel_server):
+    """A streaming /responses request must produce a chat span."""
     exporter, _ = _otel_server
     exporter.clear()
 
@@ -116,16 +116,16 @@ def test_streaming_request_produces_invoke_agent_span(_otel_server):
     spans = exporter.get_finished_spans()
     _print_span_tree(spans)
 
-    invoke_spans = _spans_by_name(spans, "invoke_agent")
-    assert invoke_spans, f"No invoke_agent span found. Got: {[s.name for s in spans]}"
+    chat_spans = _spans_by_name(spans, "chat")
+    assert chat_spans, f"No chat span found. Got: {[s.name for s in spans]}"
 
-    span = invoke_spans[0]
-    assert span.status.status_code.name != "ERROR", f"invoke_agent span has error status: {span.status}"
+    span = chat_spans[0]
+    assert span.status.status_code.name != "ERROR", f"chat span has error status: {span.status}"
 
 
 @pytest.mark.integration
-def test_invoke_agent_span_has_gen_ai_attributes(_otel_server):
-    """invoke_agent span must carry required gen_ai.* attributes."""
+def test_chat_span_has_gen_ai_attributes(_otel_server):
+    """chat span must carry required gen_ai.* attributes."""
     exporter, _ = _otel_server
     exporter.clear()
 
@@ -140,18 +140,18 @@ def test_invoke_agent_span_has_gen_ai_attributes(_otel_server):
                 pass
 
     spans = exporter.get_finished_spans()
-    invoke_spans = _spans_by_name(spans, "invoke_agent")
-    assert invoke_spans, "No invoke_agent span found"
+    chat_spans = _spans_by_name(spans, "chat")
+    assert chat_spans, "No chat span found"
 
-    attrs = dict(invoke_spans[0].attributes or {})
-    assert attrs.get("gen_ai.operation.name") == "invoke_agent", f"Missing gen_ai.operation.name: {attrs}"
+    attrs = dict(chat_spans[0].attributes or {})
+    assert attrs.get("gen_ai.operation.name") == "chat", f"Missing gen_ai.operation.name: {attrs}"
     assert attrs.get("gen_ai.provider.name") == "github.copilot", f"Missing gen_ai.provider.name: {attrs}"
     assert "gen_ai.agent.name" in attrs, f"Missing gen_ai.agent.name: {attrs}"
 
 
 @pytest.mark.integration
-def test_invoke_agent_span_records_finish_reason(_otel_server):
-    """invoke_agent span must have gen_ai.response.finish_reasons=['stop']."""
+def test_chat_span_records_finish_reason(_otel_server):
+    """chat span must have gen_ai.response.finish_reasons=['stop']."""
     exporter, _ = _otel_server
     exporter.clear()
 
@@ -166,10 +166,10 @@ def test_invoke_agent_span_records_finish_reason(_otel_server):
                 pass
 
     spans = exporter.get_finished_spans()
-    invoke_spans = _spans_by_name(spans, "invoke_agent")
-    assert invoke_spans
+    chat_spans = _spans_by_name(spans, "chat")
+    assert chat_spans
 
-    attrs = dict(invoke_spans[0].attributes or {})
+    attrs = dict(chat_spans[0].attributes or {})
     finish_reasons = attrs.get("gen_ai.response.finish_reasons")
     assert finish_reasons is not None, f"gen_ai.response.finish_reasons not set: {attrs}"
     assert "stop" in finish_reasons, f"Expected 'stop' in finish_reasons: {finish_reasons}"
@@ -214,7 +214,9 @@ def test_non_streaming_request_produces_span(_otel_server):
     spans = exporter.get_finished_spans()
     _print_span_tree(spans)
 
-    # Non-streaming goes through a different code path (no _run_streaming)
-    # but the base class wraps it in a tracer span; verify at least the adapter
-    # span (or a request-level span) was recorded.
-    assert spans, "No spans at all for non-streaming request"
+    # Non-streaming now creates its own chat span (like streaming does).
+    chat_spans = _spans_by_name(spans, "chat")
+    assert chat_spans, f"No chat span found for non-streaming request. Got: {[s.name for s in spans]}"
+
+    attrs = dict(chat_spans[0].attributes or {})
+    assert attrs.get("gen_ai.operation.name") == "chat", f"Wrong operation name: {attrs}"
