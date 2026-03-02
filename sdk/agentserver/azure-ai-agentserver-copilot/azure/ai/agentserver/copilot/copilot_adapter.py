@@ -121,14 +121,14 @@ def _on_permission_from_acl(acl: ToolAcl) -> _PermissionHandlerFn:
         kind = req.get("kind", "unknown")
         if acl is None:
             # No ACL configured — approve everything (development / local mode).
-            logger.info(f"Auto-approving tool request (no ACL): kind={kind}")
+            logger.info("Auto-approving tool request (no ACL): kind=%s", kind)
             return PermissionRequestResult(kind="approved")
 
         if acl.is_allowed(req):
-            logger.info(f"ACL allowed tool request: kind={kind}")
+            logger.info("ACL allowed tool request: kind=%s", kind)
             return PermissionRequestResult(kind="approved")
         else:
-            logger.warning(f"ACL denied tool request: kind={kind}")
+            logger.warning("ACL denied tool request: kind=%s", kind)
             return PermissionRequestResult(
                 kind="denied-by-rules",
                 rules=[],
@@ -263,10 +263,10 @@ class CopilotAdapter(FoundryCBAgent):
 
         req_converter = CopilotRequestConverter(context.request)
         prompt = req_converter.convert()
-        logger.debug(f"Copilot prompt: {prompt!r}")
+        logger.debug("Copilot prompt: %r", prompt)
         converted_attachments = req_converter.convert_attachments()
         if converted_attachments:
-            logger.debug(f"Attachments: {len(converted_attachments.attachments)} item(s)")
+            logger.debug("Attachments: %d item(s)", len(converted_attachments.attachments))
 
         client = await self._ensure_client_started()
         config = await self._refresh_token_if_needed()
@@ -276,8 +276,8 @@ class CopilotAdapter(FoundryCBAgent):
 
         if session is None:
             logger.info(
-                f"Creating new Copilot session"
-                + (f" for conversation {conversation_id!r}" if conversation_id else "")
+                "Creating new Copilot session%s",
+                " for conversation %r" % conversation_id if conversation_id else "",
             )
             # TODO: on_user_input_request needs a callback
             session_config = SessionConfig(**config, on_permission_request=self._on_permission_fn)
@@ -287,11 +287,11 @@ class CopilotAdapter(FoundryCBAgent):
                 # Evict oldest session if we've exceeded the cap
                 while len(self._sessions) > self._max_sessions:
                     evicted_id, _ = self._sessions.popitem(last=False)
-                    logger.debug(f"Evicted oldest session for conversation {evicted_id!r}")
-                logger.debug(f"Cached session {session.session_id!r} under conversation {conversation_id!r}")
+                    logger.debug("Evicted oldest session for conversation %r", evicted_id)
+                logger.debug("Cached session %r under conversation %r", session.session_id, conversation_id)
         else:
             self._sessions.move_to_end(conversation_id)
-            logger.info(f"Reusing Copilot session {session.session_id!r} for conversation turn (conversation={conversation_id!r})")
+            logger.info("Reusing Copilot session %r for conversation turn (conversation=%r)", session.session_id, conversation_id)
 
         if not context.stream:
             # Non-streaming: collect all events and extract the final text
@@ -398,7 +398,7 @@ class CopilotAdapter(FoundryCBAgent):
                             kind=trace.SpanKind.CLIENT,
                             attributes=tool_attrs,
                         )
-                        logger.debug(f"Tool span started: {tool_name!r} call_id={call_id!r}")
+                        logger.debug("Tool span started: %r call_id=%r", tool_name, call_id)
 
                     # ── Tool execution complete: close the matching child span ──────
                     elif copilot_event.type == SessionEventType.TOOL_EXECUTION_COMPLETE and data:
@@ -416,7 +416,7 @@ class CopilotAdapter(FoundryCBAgent):
                             if hasattr(data, "success") and data.success is False:
                                 tool_span.set_attribute("error.type", "tool_error")
                             tool_span.end()
-                            logger.debug(f"Tool span ended: call_id={call_id!r}")
+                            logger.debug("Tool span ended: call_id=%r", call_id)
 
                     # ── Enrich parent span from usage event ───────────────────────
                     elif copilot_event.type == SessionEventType.ASSISTANT_USAGE and data:
@@ -440,7 +440,7 @@ class CopilotAdapter(FoundryCBAgent):
                 span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
             except Exception as e:
                 span.set_attribute("error.type", type(e).__name__)
-                logger.error(f"Error during Copilot streaming: {e}")
+                logger.error("Error during Copilot streaming: %s", e)
                 raise
             finally:
                 # Close any tool spans that were never completed (e.g. stream aborted)
@@ -489,7 +489,7 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
             text = event.data.content
         key = (event.type, text)
         if key == last_key:
-            logger.debug(f"Skipping consecutive duplicate: {event.type}")
+            logger.debug("Skipping consecutive duplicate: %s", event.type)
             return
         last_key = key
 
@@ -497,15 +497,15 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
         # INFO-level trace so deployed images can diagnose event flow without requiring DEBUG.
         event_name = event.type.name if event.type else "UNKNOWN"
         if text:
-            logger.info(f"Copilot event #{event_count:03d}: {event_name} content_len={len(text)}")
+            logger.info("Copilot event #%03d: %s content_len=%d", event_count, event_name, len(text))
         else:
-            logger.info(f"Copilot event #{event_count:03d}: {event_name}")
+            logger.info("Copilot event #%03d: %s", event_count, event_name)
 
         # Always log SESSION_ERROR details at WARNING level so production logs contain
         # enough information to diagnose model/auth/infra failures without DEBUG.
         if event.type == SessionEventType.SESSION_ERROR and event.data:
             error_msg = getattr(event.data, 'message', None) or getattr(event.data, 'content', None) or repr(event.data)
-            logger.warning(f"SESSION_ERROR details: {error_msg}")
+            logger.warning("SESSION_ERROR details: %s", error_msg)
         if logger.isEnabledFor(10):  # DEBUG
             data_fields: Dict[str, Any] = {}
             if event.data is not None:
@@ -515,8 +515,8 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
                 except Exception:
                     data_fields = {"repr": repr(event.data)}
             logger.debug(
-                f"Event #{event_count:03d} {event_name} "
-                f"data={data_fields}"
+                "Event #%03d %s data=%s",
+                event_count, event_name, data_fields,
             )
 
         queue.put_nowait(event)
@@ -534,7 +534,7 @@ async def _iter_copilot_events(session, prompt: str, attachments: Optional[list]
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                raise asyncio.TimeoutError(f"Copilot session idle timeout after {timeout}s")
+                raise asyncio.TimeoutError("Copilot session idle timeout after %ds" % timeout)
             event = await asyncio.wait_for(queue.get(), timeout=remaining)
             if event is None:  # sentinel
                 return
