@@ -45,6 +45,10 @@ def _mcp(tool: str, server: str = "my-server") -> dict:
     return {"kind": "mcp", "toolName": tool, "serverName": server}
 
 
+def _custom_tool(tool: str) -> dict:
+    return {"kind": "custom-tool", "toolName": tool}
+
+
 # ===========================================================================
 # ToolAcl.from_file
 # ===========================================================================
@@ -458,6 +462,72 @@ class TestMcpRules:
         assert acl.is_allowed(_mcp("delete_file", server="safe")) is True
         # Server matches, tool doesn't → no deny → default allow
         assert acl.is_allowed(_mcp("read_file", server="dangerous")) is True
+
+
+# ===========================================================================
+# custom-tool rules
+# ===========================================================================
+
+
+@pytest.mark.unit
+class TestCustomToolRules:
+    def test_allows_custom_tool_by_name(self) -> None:
+        acl = _acl_from_yaml(
+            """\
+            version: "1"
+            default_action: deny
+            rules:
+              - kind: custom-tool
+                action: allow
+                when:
+                  tool: "^safe_"
+            """
+        )
+        assert acl.is_allowed(_custom_tool("safe_search")) is True
+        assert acl.is_allowed(_custom_tool("dangerous_exec")) is False
+
+    def test_denies_custom_tool_by_name(self) -> None:
+        acl = _acl_from_yaml(
+            """\
+            version: "1"
+            default_action: allow
+            rules:
+              - kind: custom-tool
+                action: deny
+                when:
+                  tool: "^admin_"
+            """
+        )
+        assert acl.is_allowed(_custom_tool("admin_delete")) is False
+        assert acl.is_allowed(_custom_tool("user_list")) is True
+
+    def test_blanket_allow_all_custom_tools(self) -> None:
+        """A rule without ``when`` matches all custom-tool requests."""
+        acl = _acl_from_yaml(
+            """\
+            version: "1"
+            default_action: deny
+            rules:
+              - kind: custom-tool
+                action: allow
+            """
+        )
+        assert acl.is_allowed(_custom_tool("anything")) is True
+        # Other kinds still denied
+        assert acl.is_allowed(_shell("echo hi")) is False
+
+    def test_custom_tool_does_not_match_mcp(self) -> None:
+        """A custom-tool rule must not accidentally match mcp requests."""
+        acl = _acl_from_yaml(
+            """\
+            version: "1"
+            default_action: deny
+            rules:
+              - kind: custom-tool
+                action: allow
+            """
+        )
+        assert acl.is_allowed(_mcp("some_tool")) is False
 
 
 # ===========================================================================

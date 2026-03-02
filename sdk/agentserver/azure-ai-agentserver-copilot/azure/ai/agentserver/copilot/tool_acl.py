@@ -27,6 +27,9 @@ Permission-request shape (from the Copilot SDK) by ``kind``:
 ``mcp``
     Fields: ``toolName`` (str), ``serverName`` (str — MCP server name).
 
+``custom-tool``
+    Fields: ``toolName`` (str — name of the custom tool).
+
 YAML schema
 -----------
 See the :doc:`README <../../../../../../samples/hosted_agent/README>` for the
@@ -187,11 +190,13 @@ class ToolAcl:
         for idx, rule in enumerate(self._rules):
             if rule.matches(req):
                 logger.debug(
-                    f"ACL rule #{idx + 1} ({rule.action}) matched {kind!r}: {text}"
+                    "ACL rule #%d (%s) matched %r: %s",
+                    idx + 1, rule.action, kind, text,
                 )
                 return rule.action
         logger.debug(
-            f"ACL default ({self._default}) applied to {kind!r}: {text}"
+            "ACL default (%s) applied to %r: %s",
+            self._default, kind, text,
         )
         return self._default
 
@@ -243,8 +248,8 @@ class ToolAcl:
 
         n = len(rules)
         logger.info(
-            f"Loaded tool ACL from {source}: {n} rule{'s' if n != 1 else ''}, "
-            f"default={default_action!r}"
+            "Loaded tool ACL from %s: %d rule%s, default=%r",
+            source, n, "s" if n != 1 else "", default_action,
         )
         return cls(rules=rules, default_action=default_action, source=source)
 
@@ -272,5 +277,7 @@ def _describe(req: Dict[str, Any]) -> str:
     if kind == "url":
         return repr(req.get("url", ""))
     if kind == "mcp":
-        return f"tool={req.get('toolName', '?')!r} server={req.get('serverName', '?')!r}"
+        return "tool=%r server=%r" % (req.get('toolName', '?'), req.get('serverName', '?'))
+    if kind == "custom-tool":
+        return "tool=%r" % (req.get('toolName', '?'),)
     return repr(req)
