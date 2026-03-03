@@ -314,7 +314,7 @@ The Copilot SDK's session manager discovers and invokes skills as part of its ag
 Foundry Agent Service runs containers on **linux/amd64** infrastructure. If you are building on an ARM64 machine (e.g. Apple Silicon Mac, ARM-based Linux), you **must** specify the target platform:
 
 ```bash
-docker build --platform linux/amd64 -t <acr-name>.azurecr.io/copilot-agent:v1 .
+docker build --platform linux/amd64 -t <acr-name>.azurecr.io/<image-name>:v1 .
 ```
 
 If you are already on an amd64 machine, the `--platform` flag is optional but harmless.
@@ -330,7 +330,7 @@ az acr login --name <acr-name>
 2. **Push the image:**
 
 ```bash
-docker push <acr-name>.azurecr.io/copilot-agent:v1
+docker push <acr-name>.azurecr.io/<image-name>:v1
 ```
 
 ### Full build-and-push example
@@ -338,11 +338,11 @@ docker push <acr-name>.azurecr.io/copilot-agent:v1
 ```bash
 # From the repository root directory
 docker build --platform linux/amd64 \
-  -t myacr.azurecr.io/copilot-agent:v1 \
+  -t <acr-name>.azurecr.io/<image-name>:v1 \
   -f samples/hosted_agent/Dockerfile .
 
-az acr login --name myacr
-docker push myacr.azurecr.io/copilot-agent:v1
+az acr login --name <acr-name>
+docker push <acr-name>.azurecr.io/<image-name>:v1
 ```
 
 ### Building Remotely with ACR (No Local Docker Required)
@@ -352,7 +352,7 @@ If Docker Desktop is not running or you are on a machine without Docker, you can
 ```bash
 az acr build \
   --registry <acr-name> \
-  --image copilot-agent:v1 \
+  --image <image-name>:v1 \
   --platform linux/amd64 \
   --file samples/hosted_agent/Dockerfile \
   .
@@ -385,7 +385,7 @@ client = AIProjectClient(
 )
 
 agent = client.agents.create_version(
-    agent_name="copilot-hosted-agent",
+    agent_name="<agent-name>",
     definition=ImageBasedHostedAgentDefinition(
         container_protocol_versions=[
             ProtocolVersionRecord(
@@ -394,7 +394,7 @@ agent = client.agents.create_version(
         ],
         cpu="1",
         memory="2Gi",
-        image="<acr-name>.azurecr.io/copilot-agent:v1",
+        image="<acr-name>.azurecr.io/<image-name>:v1",
         environment_variables={
             "COPILOT_MODEL": "gpt-4.1",
             "TOOL_ACL_PATH": "/app/tools_acl.yaml",
@@ -411,8 +411,8 @@ print(f"Agent created: {agent.name} v{agent.version}")
 az cognitiveservices agent create \
   --account-name <resource> \
   --project-name <project> \
-  --name copilot-hosted-agent \
-  --image <acr-name>.azurecr.io/copilot-agent:v1 \
+  --name <agent-name> \
+  --image <acr-name>.azurecr.io/<image-name>:v1 \
   --env "COPILOT_MODEL=gpt-4.1" \
        "AZURE_AI_FOUNDRY_RESOURCE_URL=https://<resource>.cognitiveservices.azure.com"
 ```
@@ -425,7 +425,7 @@ After registering the agent with `create_version()` or `az cognitiveservices age
 az cognitiveservices agent start \
   --account-name <account-name> \
   --project-name <project-name> \
-  --name copilot-hosted-agent \
+  --name <agent-name> \
   --agent-version <version-number>
 ```
 
@@ -435,7 +435,7 @@ The command returns immediately with a status of `Starting`. It may take a few m
 az cognitiveservices agent show \
   --account-name <account-name> \
   --project-name <project-name> \
-  --name copilot-hosted-agent
+  --name <agent-name>
 ```
 
 ### Stop the Agent Deployment
@@ -446,7 +446,7 @@ To stop a running agent (e.g. to save costs or before redeploying):
 az cognitiveservices agent stop \
   --account-name <account-name> \
   --project-name <project-name> \
-  --name copilot-hosted-agent
+  --name <agent-name>
 ```
 
 ### Update a Running Agent (Without Versioning)
@@ -457,7 +457,7 @@ To change properties like replica count or description without creating a new ve
 az cognitiveservices agent update \
   --account-name <account-name> \
   --project-name <project-name> \
-  --name copilot-hosted-agent \
+  --name <agent-name> \
   --min-replicas 1 \
   --max-replicas 3
 ```
@@ -480,7 +480,7 @@ To delete a specific version:
 az cognitiveservices agent delete \
   --account-name <account-name> \
   --project-name <project-name> \
-  --name copilot-hosted-agent \
+  --name <agent-name> \
   --agent-version <version-number>
 ```
 
@@ -490,7 +490,7 @@ To delete the agent entirely (all versions):
 az cognitiveservices agent delete \
   --account-name <account-name> \
   --project-name <project-name> \
-  --name copilot-hosted-agent
+  --name <agent-name>
 ```
 
 ### Linking to a Foundry Model
@@ -545,8 +545,8 @@ To deploy a Copilot-backed hosted agent on Foundry:
 
 1. Create `main.py`, `tools_acl.yaml`, and `Dockerfile` (see above or copy from `samples/hosted_agent/`)
 2. Bundle any custom code, skills, or data files into the image
-3. Build the Docker image for **linux/amd64**: `docker build --platform linux/amd64 -t <acr>.azurecr.io/copilot-agent:v1 .`
-4. Push to ACR: `docker push <acr>.azurecr.io/copilot-agent:v1`
+3. Build the Docker image for **linux/amd64**: `docker build --platform linux/amd64 -t <acr>.azurecr.io/<image-name>:v1 .`
+4. Push to ACR: `docker push <acr>.azurecr.io/<image-name>:v1`
 5. Register the agent in Foundry with `create_version()` or `az cognitiveservices agent create` — **include `AZURE_AI_FOUNDRY_RESOURCE_URL` in the environment variables**
 6. **Start the agent** with `az cognitiveservices agent start` — the container does not start automatically after registration
 7. Ensure the container's Managed Identity has `Cognitive Services OpenAI User` role on the Foundry resource
