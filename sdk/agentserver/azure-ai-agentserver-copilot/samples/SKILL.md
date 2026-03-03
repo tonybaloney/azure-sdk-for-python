@@ -1,18 +1,30 @@
 # Skill: Deploy a GitHub Copilot Hosted Agent on Microsoft Foundry
 
-## What This Project Is
+## What `azure-ai-agentserver-copilot` Is
 
-This repository contains `azure-ai-agentserver-copilot`, a Python adapter that lets you run a [GitHub Copilot SDK](https://pypi.org/project/github-copilot-sdk/) session as a **hosted agent** on Microsoft Foundry Agent Service. It exposes the standard OpenAI Responses API (RAPI) over HTTP, translating between the Copilot SDK's event protocol and RAPI streaming/non-streaming formats.
+`azure-ai-agentserver-copilot` is a Python adapter that lets you run a [GitHub Copilot SDK](https://pypi.org/project/github-copilot-sdk/) session as a **hosted agent** on Microsoft Foundry Agent Service. It exposes the standard OpenAI Responses API (RAPI) over HTTP, translating between the Copilot SDK's event protocol and RAPI streaming/non-streaming formats.
 
 The adapter handles:
 
 - Converting OpenAI-format requests into Copilot SDK `MessageOptions`
 - Running multi-turn Copilot sessions with persistent conversation state
-- Evaluating tool permission requests against a YAML-based Access Control List (ACL)
+- Evaluating tool permission requests via a YAML ACL file **or** a Python callback function
 - Converting Copilot SDK events back into RAPI Server-Sent Events (streaming) or JSON (non-streaming)
 - OpenTelemetry tracing for observability
 
-The package is **not published on PyPI**. It must be installed from source by copying the package directory into the Docker image.
+The package is **not published on PyPI**. Install it directly from GitHub:
+
+```bash
+pip install "azure-ai-agentserver-copilot @ git+https://github.com/tonybaloney/azure-sdk-for-python.git@agentserver-copilot#subdirectory=sdk/agentserver/azure-ai-agentserver-copilot"
+```
+
+Or in a `requirements.txt`:
+
+```
+azure-ai-agentserver-copilot @ git+https://github.com/tonybaloney/azure-sdk-for-python.git@agentserver-copilot#subdirectory=sdk/agentserver/azure-ai-agentserver-copilot
+```
+
+Source code: [github.com/tonybaloney/azure-sdk-for-python (agentserver-copilot branch)](https://github.com/tonybaloney/azure-sdk-for-python/tree/agentserver-copilot/sdk/agentserver/azure-ai-agentserver-copilot)
 
 ## Tutorials and References
 
@@ -142,7 +154,7 @@ The output will look like `https://<account-name>.cognitiveservices.azure.com/`.
 
 ## GitHub PAT Is NOT Required
 
-This project does **not** require a GitHub Personal Access Token (PAT). When deployed as a hosted agent with `AZURE_AI_FOUNDRY_RESOURCE_URL` set, the adapter uses **Azure AI Foundry models via BYOK (Bring Your Own Key)** — it talks directly to the Foundry model endpoint, not to GitHub's API. Authentication is handled via Managed Identity (production) or API key (development). See the [Authentication](#authentication-managed-identity) section below.
+The adapter does **not** require a GitHub Personal Access Token (PAT). When deployed as a hosted agent with `AZURE_AI_FOUNDRY_RESOURCE_URL` set, the adapter uses **Azure AI Foundry models via BYOK (Bring Your Own Key)** — it talks directly to the Foundry model endpoint, not to GitHub's API. Authentication is handled via Managed Identity (production) or API key (development). See the [Authentication](#authentication-managed-identity) section below.
 
 The `azure.yaml` file in the repo root contains a `get-github-token.mjs` hook, but that is only used for local development with `azd app run` and is not needed when deploying as a hosted agent container.
 
@@ -157,13 +169,26 @@ Your hosted agent needs three files:
 1. **`main.py`** — the entry point that starts the agent server
 2. **`requirements.txt`** — Python dependencies (for local development)
 3. **`Dockerfile`** — container image definition
-4. **`tools_acl.yaml`** (recommended) — tool access control rules
+4. **`tools_acl.yaml`** — tool access control rules (if using YAML approach)
 
 You can optionally include any additional Python modules, data files, or configuration alongside these.
 
+> **⚠️ Tool Permissions Are Deny-by-Default**
+>
+> The Copilot SDK **denies all tool calls** unless a permission handler is provided. Your agent will not be able to execute any tools (shell commands, file reads, URL fetches, etc.) unless you supply one of:
+>
+> 1. A **YAML ACL file** via `acl_path` or the `TOOL_ACL_PATH` environment variable, **or**
+> 2. A **Python callback function** via `on_permission_request`
+>
+> Choose whichever approach fits your use case — both are shown below.
+
 ### Step 1: Create `main.py`
 
-This is the minimal entry point. It uses `from_copilot()` to create the adapter and starts the HTTP server:
+There are two ways to handle tool permissions. Pick the one that suits your project.
+
+#### Option A: YAML ACL File (Declarative)
+
+Use a YAML file to define permission rules. This is the simplest approach — no Python logic required:
 
 ```python
 import asyncio
@@ -196,7 +221,66 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Step 2: Create `tools_acl.yaml`
+#### Option B: Python Callback Function
+
+If you prefer to implement permission logic in code (e.g. dynamic rules, logging, database lookups), pass a callback function instead of a YAML file:
+
+```python
+import asyncio
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
+from copilot.types import PermissionRequest, PermissionRequestResult
+from azure.ai.agentserver.copilot import from_copilot
+
+
+def handle_permission(req: PermissionRequest, ctx: dict) -> PermissionRequestResult:
+    """Custom permission handler — called for every tool the agent wants to use."""
+    kind = req.get("kind", "unknown")
+
+    # Allow file reads in safe directories
+    if kind == "read":
+        path = req.get("path", "")
+        if path.startswith(("/tmp/", "/home/app/")):
+            return PermissionRequestResult(kind="approved")
+
+    # Allow safe shell commands
+    if kind == "shell":
+        command = req.get("command", "")
+        safe_prefixes = ("ls", "cat", "head", "tail", "grep", "find", "echo", "pwd", "python")
+        if command.split()[0] in safe_prefixes:
+            return PermissionRequestResult(kind="approved")
+
+    # Allow only trusted URLs
+    if kind == "url":
+        url = req.get("url", "")
+        if "microsoft.com" in url or "github.com" in url:
+            return PermissionRequestResult(kind="approved")
+
+    # Deny everything else
+    return PermissionRequestResult(kind="denied-by-rules", rules=[])
+
+
+async def main() -> None:
+    agent = from_copilot(on_permission_request=handle_permission)
+    await agent.run_async()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+The callback receives a `PermissionRequest` dict with a `kind` field (`"shell"`, `"read"`, `"url"`, etc.) and tool-specific fields like `command`, `path`, or `url`. Return `PermissionRequestResult(kind="approved")` to allow, or `PermissionRequestResult(kind="denied-by-rules", rules=[])` to deny.
+
+> **Tip:** The callback can also be `async` — the adapter handles both sync and async functions.
+
+### Step 2: Create `tools_acl.yaml` (Option A only)
+
+If you chose Option A above, create the ACL file. If you chose Option B (callback function), skip this step.
 
 The ACL controls which tools the Copilot agent can invoke. **Always use `default_action: deny` in production.** See the full schema in the [hosted_agent sample README](hosted_agent/README.md).
 
@@ -234,7 +318,7 @@ rules:
 
 ### Step 3: Create the `Dockerfile`
 
-Since `azure-ai-agentserver-copilot` is not published on PyPI, the Dockerfile copies the **entire package source** into the image and installs it with `pip install ./package/`:
+Since `azure-ai-agentserver-copilot` is not on PyPI, the Dockerfile installs it directly from GitHub:
 
 ```dockerfile
 FROM python:3.12-slim
@@ -242,14 +326,15 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-# Copy the azure-ai-agentserver-copilot package source and install it.
-# The package is not on PyPI, so we install from the local source tree.
-COPY . package/
-RUN pip install ./package/ azure-identity "github-copilot-sdk==0.1.29"
+# Install azure-ai-agentserver-copilot from GitHub and its dependencies
+RUN pip install \
+  "azure-ai-agentserver-copilot @ git+https://github.com/tonybaloney/azure-sdk-for-python.git@agentserver-copilot#subdirectory=sdk/agentserver/azure-ai-agentserver-copilot" \
+  azure-identity \
+  "github-copilot-sdk==0.1.29"
 
 # Copy your agent entry point and ACL config
-COPY samples/hosted_agent/main.py main.py
-COPY samples/hosted_agent/tools_acl.yaml tools_acl.yaml
+COPY main.py main.py
+COPY tools_acl.yaml tools_acl.yaml
 
 # Run as non-root for security
 RUN useradd -m appuser
@@ -259,19 +344,11 @@ EXPOSE 8088
 CMD ["python", "main.py"]
 ```
 
-> **Note:** The `COPY . package/` line copies the entire repository root (which contains the `azure/ai/agentserver/copilot/` Python package and `pyproject.toml`) into the image. The `pip install ./package/` then installs it along with its dependencies (`azure-ai-agentserver-core`, `azure-identity`, `github-copilot-sdk`, `PyYAML`).
-
-If you are creating a **new** agent project outside this repo, adjust the `COPY` paths so that the package source is available inside the image. For example:
-
-```dockerfile
-# If you have the package source at /path/to/azure-ai-agentserver-copilot/
-COPY /path/to/azure-ai-agentserver-copilot/ package/
-RUN pip install ./package/
-
-# Copy your own agent files
-COPY main.py main.py
-COPY tools_acl.yaml tools_acl.yaml
-```
+> **Tip:** If you've cloned the source locally, you can instead copy it into the image and install from the local tree:
+> ```dockerfile
+> COPY /path/to/azure-ai-agentserver-copilot/ package/
+> RUN pip install ./package/ azure-identity "github-copilot-sdk==0.1.29"
+> ```
 
 ## Bundling Custom Code Into the Image
 
@@ -537,7 +614,7 @@ This is convenient for debugging but should **never** be used in production.
 | `AZURE_AI_FOUNDRY_RESOURCE_URL` | **Yes** (hosted agents) | Foundry resource endpoint URL. **Required** — without this, the adapter has no model backend and requests will hang. |
 | `AZURE_AI_FOUNDRY_API_KEY` | No | Static API key (local dev only; omit for Managed Identity) |
 | `COPILOT_MODEL` | No | Model deployment name (default: `gpt-4.1`) |
-| `TOOL_ACL_PATH` | Recommended | Path to YAML ACL file inside the container |
+| `TOOL_ACL_PATH` | Recommended (if using YAML ACL) | Path to YAML ACL file inside the container. Not needed if using a callback function. |
 
 ## Summary
 
