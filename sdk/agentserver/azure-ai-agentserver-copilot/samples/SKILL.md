@@ -362,9 +362,13 @@ This uploads the build context to ACR, builds the image remotely, and stores it 
 
 ## Deploying the Hosted Agent to Foundry
 
+> **IMPORTANT:** You **must** set the `AZURE_AI_FOUNDRY_RESOURCE_URL` environment variable when deploying to Foundry. Without it, the adapter cannot reach any model backend and requests will hang indefinitely. The container will start and pass health checks, but every inference request will time out because the Copilot SDK has no model endpoint to connect to.
+
 ### Register the Agent
 
-Use the Azure AI Projects SDK to register the container image as a hosted agent and link it to a Foundry model:
+Use the Azure AI Projects SDK to register the container image as a hosted agent and link it to a Foundry model.
+
+The `environment_variables` dict **must** include `AZURE_AI_FOUNDRY_RESOURCE_URL` — this tells the adapter to use the Foundry model endpoint via Managed Identity instead of trying to reach GitHub's API (which is not accessible from hosted containers):
 
 ```python
 from azure.ai.projects import AIProjectClient
@@ -530,7 +534,7 @@ This is convenient for debugging but should **never** be used in production.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AZURE_AI_FOUNDRY_RESOURCE_URL` | Yes (production) | Foundry resource endpoint URL |
+| `AZURE_AI_FOUNDRY_RESOURCE_URL` | **Yes** (hosted agents) | Foundry resource endpoint URL. **Required** — without this, the adapter has no model backend and requests will hang. |
 | `AZURE_AI_FOUNDRY_API_KEY` | No | Static API key (local dev only; omit for Managed Identity) |
 | `COPILOT_MODEL` | No | Model deployment name (default: `gpt-4.1`) |
 | `TOOL_ACL_PATH` | Recommended | Path to YAML ACL file inside the container |
@@ -543,7 +547,7 @@ To deploy a Copilot-backed hosted agent on Foundry:
 2. Bundle any custom code, skills, or data files into the image
 3. Build the Docker image for **linux/amd64**: `docker build --platform linux/amd64 -t <acr>.azurecr.io/copilot-agent:v1 .`
 4. Push to ACR: `docker push <acr>.azurecr.io/copilot-agent:v1`
-5. Register the agent in Foundry with `create_version()` or `az cognitiveservices agent create`
+5. Register the agent in Foundry with `create_version()` or `az cognitiveservices agent create` — **include `AZURE_AI_FOUNDRY_RESOURCE_URL` in the environment variables**
 6. **Start the agent** with `az cognitiveservices agent start` — the container does not start automatically after registration
 7. Ensure the container's Managed Identity has `Cognitive Services OpenAI User` role on the Foundry resource
 8. No GitHub PAT is needed — the agent authenticates to Foundry models via Managed Identity

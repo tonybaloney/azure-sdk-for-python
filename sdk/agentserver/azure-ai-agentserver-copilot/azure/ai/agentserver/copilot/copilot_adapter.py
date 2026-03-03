@@ -128,8 +128,16 @@ def _build_session_config() -> SessionConfig:
             ),
         )
 
-    # Fallback: default GitHub Copilot models
-    logger.info("No FOUNDRY URL configured, using default Copilot provider with model %r", model)
+    # Fallback: default GitHub Copilot models (requires GITHUB_TOKEN or GitHub CLI auth)
+    if not os.getenv("GITHUB_TOKEN"):
+        logger.error(
+            "Neither AZURE_AI_FOUNDRY_RESOURCE_URL nor GITHUB_TOKEN is set. "
+            "The adapter will not be able to authenticate to any model backend. "
+            "Set AZURE_AI_FOUNDRY_RESOURCE_URL for Foundry deployments or "
+            "GITHUB_TOKEN for GitHub Copilot models."
+        )
+    else:
+        logger.info("No FOUNDRY URL configured, using default Copilot provider with model %r", model)
     return SessionConfig(model=model)
 
 
