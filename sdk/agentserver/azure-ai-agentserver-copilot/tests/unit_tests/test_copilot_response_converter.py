@@ -18,6 +18,10 @@ from azure.ai.agentserver.core.models.projects import (
     ResponseInProgressEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
+    ResponseReasoningSummaryPartAddedEvent,
+    ResponseReasoningSummaryPartDoneEvent,
+    ResponseReasoningSummaryTextDeltaEvent,
+    ResponseReasoningSummaryTextDoneEvent,
     ResponseTextDeltaEvent,
     ResponseTextDoneEvent,
 )
@@ -267,10 +271,9 @@ class TestMultiTurn:
     def test_second_turn_gets_different_item_id(self):
         events, _ = self._run_two_turns(_make_context())
         added = [e for e in events if isinstance(e, ResponseOutputItemAddedEvent)]
-        assert len(added) == 2
-        id1 = added[0].get("item", {}).get("id")
-        id2 = added[1].get("item", {}).get("id")
-        assert id1 != id2
+        # Turn 1 is tool-only (no text content), so message output_item.added
+        # is only emitted for turn 2 which has actual text content.
+        assert len(added) == 1
 
     def test_no_response_completed_on_first_turn_when_no_content(self):
         """Tool-calling turns with no text content must NOT emit response.completed."""
@@ -528,13 +531,51 @@ class TestToStreamEvents:
 class TestReasoningEvent:
     """Tests for the ASSISTANT_REASONING event handler."""
 
-    def test_reasoning_event_produces_no_rapi_events(self):
+    def test_reasoning_event_produces_rapi_reasoning_summary_events(self):
+        """ASSISTANT_REASONING now emits RAPI reasoning summary lifecycle events."""
         context = _make_context()
         converter = CopilotStreamingResponseConverter(context)
         events = list(converter._convert_event(
             _make_event(SessionEventType.ASSISTANT_REASONING, "thinking..."), context
         ))
-        assert len(events) == 0
+        # Should emit: output_item.added, summary_part.added, text.delta,
+        #              text.done, summary_part.done, output_item.done
+        assert len(events) == 6
+        types = [e.get("type") for e in events]
+        assert types == [
+            "response.output_item.added",
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+            "response.output_item.done",
+        ]
+        # The reasoning text should be "thinking..."
+        text_done = [e for e in events if isinstance(e, ResponseReasoningSummaryTextDoneEvent)]
+        assert len(text_done) == 1
+        assert text_done[0].get("text") == "thinking..."
+
+    def test_reasoning_delta_produces_rapi_summary_text_delta(self):
+        """ASSISTANT_REASONING_DELTA emits summary text delta events."""
+        context = _make_context()
+        converter = CopilotStreamingResponseConverter(context)
+        events = list(converter._convert_event(
+            _make_event(SessionEventType.ASSISTANT_REASONING_DELTA, delta_content="chunk1"), context
+        ))
+        # First delta: output_item.added + summary_part.added + text.delta
+        assert len(events) == 3
+        assert isinstance(events[0], ResponseOutputItemAddedEvent)
+        assert isinstance(events[1], ResponseReasoningSummaryPartAddedEvent)
+        assert isinstance(events[2], ResponseReasoningSummaryTextDeltaEvent)
+        assert events[2].get("delta") == "chunk1"
+
+        # Second delta: only text.delta (no more added events)
+        events2 = list(converter._convert_event(
+            _make_event(SessionEventType.ASSISTANT_REASONING_DELTA, delta_content="chunk2"), context
+        ))
+        assert len(events2) == 1
+        assert isinstance(events2[0], ResponseReasoningSummaryTextDeltaEvent)
+        assert events2[0].get("delta") == "chunk2"
 
     def test_unhandled_event_type_produces_no_rapi_events(self):
         """Unknown/other event types should produce no RAPI events."""

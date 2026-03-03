@@ -4,6 +4,7 @@
 # pylint: disable=broad-exception-caught
 import asyncio
 import collections
+import contextlib
 import dataclasses
 import json
 import os
@@ -234,10 +235,18 @@ class CopilotAdapter(FoundryCBAgent):
         if os.getenv("AZURE_AI_FOUNDRY_RESOURCE_URL") and not os.getenv("AZURE_AI_FOUNDRY_API_KEY"):
             self._credential = DefaultAzureCredential()
 
-        # Register Starlette shutdown hook to stop the Copilot CLI process.
-        @self.app.on_event("shutdown")
-        async def _on_shutdown():
+        # Wrap the base-class lifespan to stop the CopilotClient on shutdown.
+        # Starlette 1.x removed on_event(); the lifespan context manager is the
+        # supported way to hook into startup/shutdown.
+        _base_lifespan = self.app.router.lifespan_context
+
+        @contextlib.asynccontextmanager
+        async def _lifespan_with_shutdown(app):
+            async with _base_lifespan(app) as state:
+                yield state
             await self._stop_client()
+
+        self.app.router.lifespan_context = _lifespan_with_shutdown
 
     async def _refresh_token_if_needed(self) -> SessionConfig:
         """Return the session config, refreshing the bearer token if using Foundry.

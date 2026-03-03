@@ -10,6 +10,8 @@ from copilot.generated.session_events import SessionEvent, SessionEventType
 from azure.ai.agentserver.core.models import Response as OpenAIResponse
 from azure.ai.agentserver.core.models.projects import (
     ItemContentOutputText,
+    ReasoningItemResource,
+    ReasoningItemSummaryTextPart,
     ResponseCompletedEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
@@ -19,6 +21,10 @@ from azure.ai.agentserver.core.models.projects import (
     ResponseInProgressEvent,
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
+    ResponseReasoningSummaryPartAddedEvent,
+    ResponseReasoningSummaryPartDoneEvent,
+    ResponseReasoningSummaryTextDeltaEvent,
+    ResponseReasoningSummaryTextDoneEvent,
     ResponsesAssistantMessageItemResource,
     ResponseStreamEvent,
     ResponseTextDeltaEvent,
@@ -92,6 +98,15 @@ class CopilotStreamingResponseConverter:
         self._failed: bool = False
         self._session_error: Optional[str] = None
         self._pending_message_text: Optional[str] = None
+        # Reasoning tracking
+        self._reasoning_item_id: Optional[str] = None
+        self._reasoning_started: bool = False
+        self._accumulated_reasoning_text: str = ""
+        self._reasoning_output_index: int = -1
+        # Output index management — reasoning claims index before message
+        self._next_output_index: int = 0
+        self._message_output_index: int = 0
+        self._message_item_emitted: bool = False
 
     def next_sequence(self) -> int:
         self._sequence += 1
@@ -125,6 +140,61 @@ class CopilotStreamingResponseConverter:
             response_data["error"] = error
         return OpenAIResponse(response_data)
 
+    def _ensure_message_item_emitted(
+        self,
+    ) -> Generator[ResponseStreamEvent, None, None]:
+        """Lazily emit output_item.added + content_part.added for the message.
+
+        Deferred from TURN_START so that reasoning items can claim an
+        earlier ``output_index`` in the response output array.
+        """
+        if not self._message_item_emitted:
+            self._message_item_emitted = True
+            self._message_output_index = self._next_output_index
+            self._next_output_index += 1
+            yield ResponseOutputItemAddedEvent(
+                sequence_number=self.next_sequence(),
+                output_index=self._message_output_index,
+                item=ResponsesAssistantMessageItemResource(
+                    id=self._item_id,
+                    status="in_progress",
+                    content=[],
+                ),
+            )
+            yield ResponseContentPartAddedEvent(
+                sequence_number=self.next_sequence(),
+                item_id=self._item_id,
+                output_index=self._message_output_index,
+                content_index=0,
+                part=ItemContentOutputText(text="", annotations=[]),
+            )
+
+    def _ensure_reasoning_started(
+        self,
+        context: AgentRunContext,
+    ) -> Generator[ResponseStreamEvent, None, None]:
+        """Lazily emit output_item.added + summary_part.added for reasoning."""
+        if not self._reasoning_started:
+            self._reasoning_started = True
+            self._reasoning_item_id = context.id_generator.generate_message_id()
+            self._reasoning_output_index = self._next_output_index
+            self._next_output_index += 1
+            yield ResponseOutputItemAddedEvent(
+                sequence_number=self.next_sequence(),
+                output_index=self._reasoning_output_index,
+                item=ReasoningItemResource(
+                    id=self._reasoning_item_id,
+                    summary=[],
+                ),
+            )
+            yield ResponseReasoningSummaryPartAddedEvent(
+                sequence_number=self.next_sequence(),
+                item_id=self._reasoning_item_id,
+                output_index=self._reasoning_output_index,
+                summary_index=0,
+                part=ReasoningItemSummaryTextPart(text=""),
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -153,6 +223,11 @@ class CopilotStreamingResponseConverter:
                 self._item_id = context.id_generator.generate_message_id()
                 item_id = self._item_id
                 self._accumulated_text = ""
+                self._reasoning_started = False
+                self._accumulated_reasoning_text = ""
+                self._reasoning_item_id = None
+                self._message_item_emitted = False
+                self._next_output_index = 0
                 is_first_turn = self._turn_count == 0
                 self._turn_count += 1
 
@@ -165,30 +240,18 @@ class CopilotStreamingResponseConverter:
                         sequence_number=self.next_sequence(),
                         response=self._build_response("in_progress"),
                     )
-                yield ResponseOutputItemAddedEvent(
-                    sequence_number=self.next_sequence(),
-                    output_index=0,
-                    item=ResponsesAssistantMessageItemResource(
-                        id=item_id,
-                        status="in_progress",
-                        content=[],
-                    ),
-                )
-                yield ResponseContentPartAddedEvent(
-                    sequence_number=self.next_sequence(),
-                    item_id=item_id,
-                    output_index=0,
-                    content_index=0,
-                    part=ItemContentOutputText(text="", annotations=[]),
-                )
+                # Message output_item.added and content_part.added are
+                # deferred to _ensure_message_item_emitted() so that
+                # reasoning items can claim an earlier output_index.
 
             # ── Streaming text delta ──────────────────────────────────────────
             case SessionEvent(type=SessionEventType.ASSISTANT_MESSAGE_DELTA, data=data) if data and data.content:
+                yield from self._ensure_message_item_emitted()
                 self._accumulated_text += data.content
                 yield ResponseTextDeltaEvent(
                     sequence_number=self.next_sequence(),
                     item_id=item_id,
-                    output_index=0,
+                    output_index=self._message_output_index,
                     content_index=0,
                     delta=data.content,
                 )
@@ -215,11 +278,12 @@ class CopilotStreamingResponseConverter:
                 text = data.content
 
                 if not self._accumulated_text:
+                    yield from self._ensure_message_item_emitted()
                     self._accumulated_text = text
                     yield ResponseTextDeltaEvent(
                         sequence_number=self.next_sequence(),
                         item_id=item_id,
-                        output_index=0,
+                        output_index=self._message_output_index,
                         content_index=0,
                         delta=text,
                     )
@@ -261,27 +325,39 @@ class CopilotStreamingResponseConverter:
                     yield ResponseTextDoneEvent(
                         sequence_number=self.next_sequence(),
                         item_id=item_id,
-                        output_index=0,
+                        output_index=self._message_output_index,
                         content_index=0,
                         text=text,
                     )
                     yield ResponseContentPartDoneEvent(
                         sequence_number=self.next_sequence(),
                         item_id=item_id,
-                        output_index=0,
+                        output_index=self._message_output_index,
                         content_index=0,
                         part=ItemContentOutputText(text=text, annotations=[]),
                     )
                     yield ResponseOutputItemDoneEvent(
                         sequence_number=self.next_sequence(),
-                        output_index=0,
+                        output_index=self._message_output_index,
                         item=completed_item,
                     )
+                    # Build the completed output array, including reasoning
+                    # if it was emitted during this turn.
+                    output_items: list = []
+                    if self._reasoning_item_id:
+                        summary_part = ReasoningItemSummaryTextPart(
+                            text=self._accumulated_reasoning_text,
+                        )
+                        output_items.append(ReasoningItemResource(
+                            id=self._reasoning_item_id,
+                            summary=[summary_part],
+                        ))
+                    output_items.append(completed_item)
                     yield ResponseCompletedEvent(
                         sequence_number=self.next_sequence(),
                         response=self._build_response(
                             "completed",
-                            output=[completed_item],
+                            output=output_items,
                             usage=self._usage,
                         ),
                     )
@@ -291,6 +367,7 @@ class CopilotStreamingResponseConverter:
             case SessionEvent(type=SessionEventType.SESSION_IDLE):
                 if not self._completed and not self._failed and self._turn_count > 0:
                     logger.warning("SESSION_IDLE without response.completed — forcing completion")
+                    yield from self._ensure_message_item_emitted()
                     # Use accumulated text, or error message, or fallback.
                     text = self._accumulated_text
                     if not text.strip():
@@ -303,37 +380,46 @@ class CopilotStreamingResponseConverter:
                         status="completed",
                         content=[ItemContentOutputText(text=text, annotations=[])],
                     )
-                    output = [completed_item]
                     # Emit the full done-event chain so clients see well-formed output.
                     yield ResponseTextDeltaEvent(
                         sequence_number=self.next_sequence(),
                         item_id=item_id,
-                        output_index=0,
+                        output_index=self._message_output_index,
                         content_index=0,
                         delta=text,
                     )
                     yield ResponseTextDoneEvent(
                         sequence_number=self.next_sequence(),
                         item_id=item_id,
-                        output_index=0,
+                        output_index=self._message_output_index,
                         content_index=0,
                         text=text,
                     )
                     yield ResponseContentPartDoneEvent(
                         sequence_number=self.next_sequence(),
                         item_id=item_id,
-                        output_index=0,
+                        output_index=self._message_output_index,
                         content_index=0,
                         part=ItemContentOutputText(text=text, annotations=[]),
                     )
                     yield ResponseOutputItemDoneEvent(
                         sequence_number=self.next_sequence(),
-                        output_index=0,
+                        output_index=self._message_output_index,
                         item=completed_item,
                     )
+                    output_items: list = []
+                    if self._reasoning_item_id:
+                        summary_part = ReasoningItemSummaryTextPart(
+                            text=self._accumulated_reasoning_text,
+                        )
+                        output_items.append(ReasoningItemResource(
+                            id=self._reasoning_item_id,
+                            summary=[summary_part],
+                        ))
+                    output_items.append(completed_item)
                     yield ResponseCompletedEvent(
                         sequence_number=self.next_sequence(),
-                        response=self._build_response("completed", output=output, usage=self._usage),
+                        response=self._build_response("completed", output=output_items, usage=self._usage),
                     )
                     self._completed = True
 
@@ -343,15 +429,60 @@ class CopilotStreamingResponseConverter:
                 warning_msg = getattr(data, 'message', None) or "" if data else ""
                 logger.warning("Copilot session warning: type=%s message=%s", warning_type, warning_msg)
 
-            # ── Reasoning ─────────────────────────────────────────────────────
-            case SessionEvent(type=SessionEventType.ASSISTANT_REASONING, data=data):
-                if data and data.content:
-                    logger.debug("Copilot reasoning: %r", data.content[:120])
-
             # ── Reasoning delta (streaming chunks) ────────────────────────────
-            case SessionEvent(type=SessionEventType.ASSISTANT_REASONING_DELTA, data=data):
-                if data and data.delta_content:
-                    logger.debug("Copilot reasoning delta: %r", data.delta_content[:120])
+            # Mapped to RAPI reasoning_summary_text.delta events.
+            case SessionEvent(type=SessionEventType.ASSISTANT_REASONING_DELTA, data=data) if data and data.delta_content:
+                yield from self._ensure_reasoning_started(context)
+                self._accumulated_reasoning_text += data.delta_content
+                yield ResponseReasoningSummaryTextDeltaEvent(
+                    sequence_number=self.next_sequence(),
+                    item_id=self._reasoning_item_id,
+                    output_index=self._reasoning_output_index,
+                    summary_index=0,
+                    delta=data.delta_content,
+                )
+
+            # ── Reasoning (full text — authoritative) ─────────────────────────
+            # Finalises the reasoning output item with done-events.
+            case SessionEvent(type=SessionEventType.ASSISTANT_REASONING, data=data) if data and data.content:
+                text = data.content
+
+                # If no deltas arrived, emit the full lifecycle.
+                if not self._reasoning_started:
+                    yield from self._ensure_reasoning_started(context)
+                    yield ResponseReasoningSummaryTextDeltaEvent(
+                        sequence_number=self.next_sequence(),
+                        item_id=self._reasoning_item_id,
+                        output_index=self._reasoning_output_index,
+                        summary_index=0,
+                        delta=text,
+                    )
+
+                self._accumulated_reasoning_text = text
+                summary_part = ReasoningItemSummaryTextPart(text=text)
+
+                yield ResponseReasoningSummaryTextDoneEvent(
+                    sequence_number=self.next_sequence(),
+                    item_id=self._reasoning_item_id,
+                    output_index=self._reasoning_output_index,
+                    summary_index=0,
+                    text=text,
+                )
+                yield ResponseReasoningSummaryPartDoneEvent(
+                    sequence_number=self.next_sequence(),
+                    item_id=self._reasoning_item_id,
+                    output_index=self._reasoning_output_index,
+                    summary_index=0,
+                    part=summary_part,
+                )
+                yield ResponseOutputItemDoneEvent(
+                    sequence_number=self.next_sequence(),
+                    output_index=self._reasoning_output_index,
+                    item=ReasoningItemResource(
+                        id=self._reasoning_item_id,
+                        summary=[summary_part],
+                    ),
+                )
 
             # ── Intent classification ─────────────────────────────────────────
             case SessionEvent(type=SessionEventType.ASSISTANT_INTENT, data=data):

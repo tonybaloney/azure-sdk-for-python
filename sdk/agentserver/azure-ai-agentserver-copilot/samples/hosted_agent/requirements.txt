@@ -1,5 +1,5 @@
 -e ../..
 azure-identity
-github-copilot-sdk==0.1.25
+github-copilot-sdk==0.1.29
 python-dotenv
 PyYAML>=6.0

@@ -1,2 +1,2 @@
 -e ../..
-github-copilot-sdk==0.1.25
+github-copilot-sdk==0.1.29
